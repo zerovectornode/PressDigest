@@ -72,7 +72,7 @@ def parse_metadata_from_pdf(pdf_path, config) -> ParsedMetadata:
     """Extracts just page 1 (no bronze cache write) to read the masthead."""
     with pdfplumber.open(pdf_path) as pdf:
         page = pdf.pages[0]
-        _metadata, lines = build_page(page, 1, config)
+        _metadata, lines, _word_space_log = build_page(page, 1, config)
 
     # Lines are already in stream order by construction - no re-sorting needed.
     return parse_masthead([line.text for line in lines])

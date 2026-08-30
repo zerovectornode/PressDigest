@@ -6,7 +6,7 @@ import pdfplumber
 import pytest
 
 from hindu_extract.lines import build_page
-from hindu_extract.verify import check_text_fidelity
+from hindu_extract.verify import check_text_fidelity, check_word_space_correction_fidelity
 
 BASELINE_PATH = Path(__file__).parent / "baselines" / "page_counts.json"
 
@@ -43,11 +43,27 @@ def test_text_fidelity_matches_raw_extraction(pdf_path, config, all_page_nums):
     with pdfplumber.open(pdf_path) as pdf:
         for page_num in all_page_nums:
             page = pdf.pages[page_num - 1]
-            _metadata, lines = build_page(page, page_num, config)
+            _metadata, lines, _word_space_log = build_page(page, page_num, config)
             ok, reconstructed, raw = check_text_fidelity(page, lines)
             if not ok:
                 mismatches.append((page_num, len(reconstructed), len(raw)))
     assert not mismatches, f"text fidelity mismatch on pages (page, recon_len, raw_len): {mismatches}"
+
+
+def test_word_space_correction_never_alters_a_real_character(pdf_path, config, all_page_nums):
+    """Line.corrected_text (see lines.py word_space_gap_ratio) may only ever
+    insert a synthetic ASCII space relative to Line.text - never add, drop,
+    reorder, or alter a real character. Checked per line, per page, across
+    the whole edition."""
+    mismatches = []
+    with pdfplumber.open(pdf_path) as pdf:
+        for page_num in all_page_nums:
+            page = pdf.pages[page_num - 1]
+            _metadata, lines, _word_space_log = build_page(page, page_num, config)
+            ok, line_mismatches = check_word_space_correction_fidelity(lines)
+            if not ok:
+                mismatches.append((page_num, line_mismatches))
+    assert not mismatches, f"word-space correction altered real characters on pages: {mismatches}"
 
 
 def test_line_count_and_char_count_regression_baseline(all_outcomes):

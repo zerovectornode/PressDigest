@@ -19,7 +19,7 @@ from collections import Counter
 
 from hindu_extract.config import Config
 from hindu_extract.fonts import get_font_inventory
-from hindu_extract.models import FontProfile, Line, LineFlags, PageMetadata
+from hindu_extract.models import FontProfile, Line, LineFlags, PageMetadata, WordSpaceInsertion
 
 
 def modal_font_size(chars: list[dict]) -> float:
@@ -89,7 +89,52 @@ def _group_lines(chars: list[dict], row_tol: float, gap_ratio: float, outlier_th
     return lines
 
 
-def build_page(page, page_num: int, config: Config) -> tuple[PageMetadata, list[Line]]:
+def _join_group_text(
+    group: list[dict], word_space_gap_ratio: float, page_num: int, line_no: int
+) -> tuple[str, str, list[WordSpaceInsertion]]:
+    """Concatenates one line's characters exactly as before (the return
+    value's whitespace-stripped content is unchanged - see verify.py), but
+    also computes a second, corrected variant with a synthetic ASCII space
+    inserted between two adjacent alphabetic characters wherever the gap
+    between them is wide enough to be a real word-space that this PDF
+    simply never encoded as a literal space glyph (see config/default.yaml
+    word_space_gap_ratio for the calibration). Restricted to alphabetic
+    pairs on both sides: this is what excludes punctuation/digit-heavy runs
+    (stock-ticker leader dots, decorative dividers) without needing a
+    separate magnitude cap - see the calibration note in config/default.yaml.
+
+    Every insertion is logged - see design/DESIGN.md "Word-space gap fix".
+    """
+    literal_parts: list[str] = []
+    corrected_parts: list[str] = []
+    insertions: list[WordSpaceInsertion] = []
+    for i, c in enumerate(group):
+        if i > 0:
+            prev = group[i - 1]
+            if prev["text"].isalpha() and c["text"].isalpha():
+                size = prev.get("size") or c.get("size") or 0
+                if size:
+                    gap = c["x0"] - prev["x1"]
+                    ratio = gap / size
+                    if ratio > word_space_gap_ratio:
+                        corrected_parts.append(" ")
+                        insertions.append(
+                            WordSpaceInsertion(
+                                page_num=page_num,
+                                line_no=line_no,
+                                position=prev["stream_index"],
+                                char_before=prev["text"],
+                                char_after=c["text"],
+                                gap=round(gap, 3),
+                                ratio=round(ratio, 3),
+                            )
+                        )
+        literal_parts.append(c["text"])
+        corrected_parts.append(c["text"])
+    return "".join(literal_parts), "".join(corrected_parts), insertions
+
+
+def build_page(page, page_num: int, config: Config) -> tuple[PageMetadata, list[Line], list[WordSpaceInsertion]]:
     raw_chars = list(page.chars)
     chars = [dict(c, stream_index=i) for i, c in enumerate(raw_chars)]
     modal = modal_font_size(chars)
@@ -100,10 +145,13 @@ def build_page(page, page_num: int, config: Config) -> tuple[PageMetadata, list[
     outlier_threshold = thresholds.size_outlier_ratio * modal if modal else float("inf")
 
     char_groups = _group_lines(chars, row_tol, gap_ratio, outlier_threshold)
+    word_space_ratio = thresholds.word_space_gap_ratio
 
     lines: list[Line] = []
+    word_space_log: list[WordSpaceInsertion] = []
     for line_no, group in enumerate(char_groups, start=1):
-        text = "".join(c["text"] for c in group)
+        text, corrected_text, insertions = _join_group_text(group, word_space_ratio, page_num, line_no)
+        word_space_log.extend(insertions)
         bbox = (
             min(c["x0"] for c in group),
             min(c["top"] for c in group),
@@ -119,6 +167,7 @@ def build_page(page, page_num: int, config: Config) -> tuple[PageMetadata, list[
                 line_no=line_no,
                 page_num=page_num,
                 text=text,
+                corrected_text=corrected_text,
                 bbox=bbox,
                 font_profile=FontProfile(
                     name=font_name,
@@ -146,4 +195,4 @@ def build_page(page, page_num: int, config: Config) -> tuple[PageMetadata, list[
         char_count=len(chars),
         line_count=len(lines),
     )
-    return metadata, lines
+    return metadata, lines, word_space_log

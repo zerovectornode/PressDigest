@@ -19,6 +19,7 @@ class Thresholds:
     kerning_gap_ratio: float
     span_break_gap_ratio: float
     row_band_tolerance_ratio: float
+    word_space_gap_ratio: float
 
 
 @dataclass(frozen=True)

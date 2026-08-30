@@ -847,3 +847,126 @@ validation failure, the retry prompt is appended with the exact issues
 found (e.g. "you used category X, not in the enum" or the specific
 duplicate-continuation pairs), not just re-sent as-is.
 
+## Word-space gap fix
+
+Found by inspection: page 17's headline read "Apeek into the future of
+sports industry" - missing the space between "A" and "peek". Measured
+directly against `page.chars`: the gap between "A" and "peek" is 3.507pt at
+15.941pt font (ratio 0.220) - numerically identical to the gap between
+"peek" and "into" later on the SAME line, which DOES have an explicit space
+glyph. The PDF's content stream simply omits the space glyph entirely for
+some single-character words ("a"/"A"/"i"/"I") followed directly by the next
+word, encoding only a normal-width positioning gap. `lines.py`'s line-text
+construction (`text = "".join(c["text"] for c in group)`) had no mechanism
+at all for inferring a space from geometry - not a miscalibrated threshold,
+an entirely absent capability.
+
+**Scale, established before fixing anything** (per the standing rule of
+investigating before guessing at a fix - see "Standing rule" above for the
+same discipline applied to a different bug class): a targeted dictionary
+sweep (word not in dictionary, starts with lowercase "a"/"i", remainder is
+a common dictionary word - see `word_fusion_review.py`) found 74 candidates
+across the edition; context-checking each by hand found ~49 genuine
+fusions (e.g. "aday"->"a day after", "ABench"->"A Bench of Justices",
+recurring 5x as a standard Indian judicial-reporting phrase) and ~25 false
+positives that are real proper nouns coincidentally shaped this way (Amit
+Shah, Akali Dal, Ayon Sengupta, the acronym AHEL). Extending the same sweep
+to other short words (in/an/of/on/...) found only ~3 genuine hits out of 27
+candidates - the defect is concentrated in single-character words, not a
+general phenomenon. A separate reverse sweep (adjacent word pairs that join
+into a valid dictionary word, checking for the opposite failure - a
+spurious space splitting one real word into two) found 280 candidates, all
+280 of them common short-word coincidences ("in a"->"ina", "be held"->
+"beheld") and zero genuine spurious splits - that failure mode does not
+appear to exist on this PDF.
+
+**Why a geometric threshold is safe here, once measured precisely.**
+Comparing the bug's gap ratio (0.22) against a real word-gap elsewhere on
+the same line (also 0.22) suggested at first that gap size alone might be
+irreducibly ambiguous. That comparison asked the wrong question. The
+threshold only has to separate the bug from ordinary *intra-word* kerning,
+not from real word-gaps - and there the two populations don't overlap at
+all: measured across all 18 pages (alpha-to-alpha adjacent pairs within
+words identified by pdfplumber's own `extract_words()`), the intra-word gap
+ratio ceiling was <=0.088 everywhere, typically <=0.05. Eight confirmed
+missing-space bugs sampled across eight different pages measured
+0.18-0.54. A full-edition geometric sweep (alpha-only pairs, ratio in
+(0.10, 0.8], the upper bound excluding a page-11 stock-table leader-dot
+line at ratio 8.9 that isn't prose at all) found genuine instances up to
+0.71 - still zero overlap with kerning. `word_space_gap_ratio: 0.12` (see
+config/default.yaml) sits in the gap; the total insertion count was stable
+within 5 across the whole tested range (0.08/0.10/0.12/0.15), so the exact
+value inside that range is not load-bearing.
+
+**Before/after impact, measured against the real pipeline before
+committing to a threshold.** A first pass (naive row-grouping across each
+page's full width, ignoring column boundaries) found 163 raw candidates and
+looked alarming - "-|demand", "e" appended after unrelated column text at
+ratio 28-41 - but these turned out to be artifacts of that *simulation*,
+not the real bug: `lines.py`'s actual stream-order grouping (which follows
+the content stream per contiguous story, not a page-wide geometric sort -
+see "Stream-order rebuild" above) never produces them, verified directly
+against `build_page()`'s real output for seven sampled cases. Of the
+remaining candidates, 18 were a recurring masthead artifact ("A ND-NDE",
+identical every page) and ~20 were inside a page-2 name-change classified
+notice - both confirmed absent from every gold article's fields (they're in
+`excluded_line_nos`), so out of scope regardless. The real, in-pipeline
+count of article-body insertions is reported per-run in
+`word_space_log` (see below) rather than re-estimated by hand each time.
+
+**Implementation.** `Line` gained a second text field,
+`corrected_text` (`models.py`): `Line.text` remains exactly the literal,
+uncorrected glyph-joined text it always was, and - critically - is what
+`gemini_prompt.py`'s line dump is still built from. This was a deliberate
+constraint, not an oversight: the Phase 2 Gemini response cache is keyed on
+a hash of that exact prompt text (`gemini_client.py`), so if `text` itself
+had gained the synthetic spaces, every page with at least one insertion
+(nearly all of them) would have missed cache and triggered a fresh live
+API call for no boundary-relevant reason - boundaries are found by line
+NUMBER, not exact character content, so the model never needed the
+correction to do its job. `corrected_text` carries the fix instead, and
+`assemble.py`'s `_join_consecutive` builds each field's `cleaned` output
+(the reader-facing `headline`/`body`/`deck`/etc.) from `corrected_text`
+while `raw` (the `*_raw` fields) keeps using `text` - `_raw` fields exist
+specifically to preserve literal, unprocessed extraction. Checksum
+validation (`phase3.py`) was left untouched, still built from the same
+`_join_consecutive`, because it doesn't need special-casing: both
+`_fuzzy_prefix_match`/`_fuzzy_suffix_match` already strip whitespace as a
+fallback match (originally for an unrelated drop-cap spacing artifact), so
+a checksum copied from the uncorrected dump still matches a corrected
+candidate string. `word_space_gap_ratio` bumped `pipeline_version` (Phase 1
+cache) but not `gemini.prompt_version` (Phase 2 cache) - the two caches are
+independent for exactly this reason.
+
+Every insertion is logged unconditionally (`WordSpaceInsertion`, `lines.py`)
+with page, line, stream position, the two characters, the measured gap, and
+its ratio - written into bronze `page.json` as `word_space_log`, then
+filtered to each gold article's own referenced lines and included in
+`articles.json` the same way `dehyphenation_log` already is. Nothing this
+fix does is silent.
+
+**The verbatim guarantee, restated precisely.** `verify.py`'s
+`check_text_fidelity` is unchanged and still proves exactly what it always
+proved: `Line.text` (never touched by this fix) matches raw pdfplumber
+extraction with whitespace stripped from both sides. A new function,
+`check_word_space_correction_fidelity`, checks the new invariant this fix
+introduces: per line, `corrected_text` matches `text` with whitespace
+stripped from both sides too - i.e. the correction is provably restricted
+to inserting whitespace and can never add, drop, reorder, or alter a real
+character. Comparing with whitespace stripped from both sides is not a
+looser stand-in for "character-for-character identical" - restricted to
+the non-whitespace characters, it IS that guarantee, which is the only
+form of it that can coexist with permitting synthetic separator insertion
+at all. Both checks run per-line, across every one of the 18 pages, as
+their own regression tests.
+
+**Soft canary, not a hard-fail one.** The dictionary sweep used to measure
+scale above is wired into the pipeline as `word_fusion_review.py`, run
+per-article over the assembled (corrected) text and stored as
+`word_fusion_review` in gold JSON - but it never sets `needs_review` or
+fails `validation_ok`. Its ~34% false-positive rate on real proper nouns
+(Amit Shah, Akali Dal, Ayon Sengupta, AHEL, ...) is exactly the same
+structural problem the ligature canary's dictionary approach was rejected
+for (see "Ligature canary" above) - a human can skim a flagged list, but a
+build should not fail on it. The geometric check (`lines.py`) is the actual
+fix; the ligature canary (`canary.py`) remains the only hard-fail check.

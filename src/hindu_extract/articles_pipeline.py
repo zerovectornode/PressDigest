@@ -20,6 +20,19 @@ from hindu_extract.phase3 import ValidationResult
 from hindu_extract.rate_limit import TokenAwareLimiter
 from hindu_extract.storage import bronze_page_dir
 from hindu_extract.trace import RunTracer
+from hindu_extract.word_fusion_review import find_candidates
+
+
+def _word_fusion_review(article: AssembledArticle) -> list[dict]:
+    """Soft, review-only dictionary sweep over an article's own assembled
+    (corrected) text - see word_fusion_review.py. Never affects
+    validation_ok/needs_review; a human skims this list, it never fails a
+    build (unlike canary.py's geometric checks)."""
+    texts = [article.headline, article.byline, article.body, *article.deck, *article.captions]
+    candidates = []
+    for text in texts:
+        candidates.extend(find_candidates(text))
+    return [c.to_dict() for c in candidates]
 
 
 def _issues_by_article(validation: ValidationResult) -> dict[str, list[str]]:
@@ -45,6 +58,7 @@ def _line_from_dict(d: dict) -> Line:
         line_no=d["line_no"],
         page_num=d["page_num"],
         text=d["text"],
+        corrected_text=d.get("corrected_text", d["text"]),
         bbox=tuple(d["bbox"]),
         font_profile=FontProfile(**d["font_profile"]),
         stream_start=d["stream_start"],
@@ -110,17 +124,36 @@ def process_page_articles(
         detail["drop_cap_fusions"] = sum(
             1 for a in articles for n in a.line_nos if lines_by_no.get(n) and lines_by_no[n].flags.single_glyph
         )
+        referenced_line_nos_for_trace = {n for a in articles for n in a.line_nos}
+        detail["word_space_insertions"] = sum(
+            1 for w in page_data.get("word_space_log", []) if w["line_no"] in referenced_line_nos_for_trace
+        )
 
     referenced_line_nos = {n for a in articles for n in a.line_nos}
     all_line_nos = {line.line_no for line in lines}
     excluded_line_nos = sorted(all_line_nos - referenced_line_nos)
 
+    # Phase 1 logs every word-space insertion for the whole page (see
+    # lines.py, config/default.yaml word_space_gap_ratio); filtered here to
+    # the lines an assembled article actually references, the same way
+    # excluded_line_nos above narrows all_line_nos - so this reflects what
+    # readers of THIS article's text actually see, not page furniture.
+    word_space_log = [
+        w for w in page_data.get("word_space_log", []) if w["line_no"] in referenced_line_nos
+    ]
+
     out_dir = gold_page_dir(config, edition, date, page_num)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    article_dicts = []
+    for a in articles:
+        d = a.to_dict()
+        d["word_fusion_review"] = _word_fusion_review(a)
+        article_dicts.append(d)
+
     gold = {
         "page_num": page_num,
-        "articles": [a.to_dict() for a in articles],
+        "articles": article_dicts,
         "excluded_line_nos": excluded_line_nos,
         "validation_ok": outcome.validation.ok,
         "boundary_fixups": [f.to_dict() for f in outcome.boundary_fixups],
@@ -130,6 +163,7 @@ def process_page_articles(
             "coverage_ratio": outcome.validation.coverage.coverage_ratio,
         },
         "dehyphenation_log": [j.to_dict() for j in join_log],
+        "word_space_log": word_space_log,
     }
     (out_dir / "articles.json").write_text(
         json.dumps(gold, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -209,7 +243,13 @@ def write_edition_markdown(config: Config, edition: str, date: str, page_nums: l
         if not articles_path.exists():
             continue
         gold = json.loads(articles_path.read_text(encoding="utf-8"))
-        articles = [AssembledArticle(**a) for a in gold["articles"]]
+        # word_fusion_review is a soft, review-only field appended to each
+        # article's dict for gold JSON only (see _word_fusion_review above)
+        # - it is not part of AssembledArticle's schema.
+        articles = [
+            AssembledArticle(**{k: v for k, v in a.items() if k != "word_fusion_review"})
+            for a in gold["articles"]
+        ]
         pages.append((page_num, articles))
 
     md = render_edition_markdown(edition, date, pages)

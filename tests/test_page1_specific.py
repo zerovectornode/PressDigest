@@ -10,7 +10,7 @@ PAGE_NUM = 1
 def _page1_lines(pdf_path, config):
     with pdfplumber.open(pdf_path) as pdf:
         page = pdf.pages[PAGE_NUM - 1]
-        _metadata, lines = build_page(page, PAGE_NUM, config)
+        _metadata, lines, _word_space_log = build_page(page, PAGE_NUM, config)
         return lines
 
 
@@ -33,7 +33,7 @@ def test_meet_hyphen_line_immediately_precedes_ings_line_in_stream_order(pdf_pat
     in the raw content stream, with no reordering needed."""
     with pdfplumber.open(pdf_path) as pdf:
         page = pdf.pages[PAGE_NUM - 1]
-        _metadata, lines = build_page(page, PAGE_NUM, config)
+        _metadata, lines, _word_space_log = build_page(page, PAGE_NUM, config)
 
     meet_line = next(l for l in lines if l.text.rstrip().endswith("meet-"))
     idx = lines.index(meet_line)

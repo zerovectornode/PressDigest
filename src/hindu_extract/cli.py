@@ -186,7 +186,7 @@ def debug_overlay(pdf_path, page_num, out, config_path):
     config = load_config(config_path)
     with pdfplumber.open(pdf_path) as pdf:
         page = pdf.pages[page_num - 1]
-        _metadata, lines = build_page(page, page_num, config)
+        _metadata, lines, _word_space_log = build_page(page, page_num, config)
         image = render_debug_overlay(page, lines, config.render.hires_dpi)
         image.save(out)
     click.echo(f"wrote {out} ({len(lines)} lines overlaid)")

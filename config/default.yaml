@@ -2,10 +2,14 @@
 # Calibration notes reference measurements taken directly on docs/Newspaper.pdf
 # (18-page The Hindu Delhi e-paper, 2025-09-13 issue) during initial inspection.
 
-pipeline_version: "2.0.0"  # bumped for the stream-order rebuild (span/unit
-                            # layers replaced by lines - see design/DESIGN.md
-                            # "Stream-order rebuild"); bump this to force
-                            # cache invalidation for ALL pages
+pipeline_version: "2.1.0"  # bumped for the word-space gap fix (lines.py now
+                            # computes Line.corrected_text - see
+                            # word_space_gap_ratio below and design/DESIGN.md
+                            # "Word-space gap fix"); Line.text itself is
+                            # unchanged (still the literal glyph-joined text),
+                            # so this does NOT change the Gemini prompt dump
+                            # or its cache key - only Phase 1's bronze cache
+                            # needs to be invalidated, not Phase 2's
 
 paths:
   bronze_root: "data/bronze"
@@ -72,6 +76,34 @@ thresholds:
   # Vertical tolerance for clustering characters into the same row-band,
   # relative to the page's modal font size. Standard fraction-of-em banding.
   row_band_tolerance_ratio: 0.3
+
+  # Word-space gap fix (see design/DESIGN.md "Word-space gap fix"): some
+  # single-character words ("A", "a", "I") in this PDF have no space glyph
+  # in the content stream at all between them and the next word - only a
+  # normal-width positioning gap, e.g. "Apeek" for "A peek" on page 17. When
+  # two ADJACENT ALPHABETIC characters within one line have no space glyph
+  # between them and gap/font_size exceeds this ratio, lines.py inserts a
+  # synthetic ASCII space into Line.corrected_text (Line.text, the literal
+  # glyph-joined text used for the Gemini prompt, is never touched - see
+  # pipeline_version above).
+  #
+  # Calibrated on this PDF: measured normal intra-word (alpha-to-alpha)
+  # kerning gap ratio ceiling across all 18 pages was <=0.088 (page 6),
+  # typically <=0.05, using pdfplumber's own extract_words() to identify
+  # genuine single words. Measured gap ratios for 8 confirmed missing-space
+  # bugs sampled across 8 different pages (aday, anote, Ihave, ABench,
+  # Arelentless, Ineed, Apeek, Afor) ranged 0.18-0.54, and a full-edition
+  # geometric sweep (alpha-only pairs, ratio in (0.10, 0.8] to also exclude
+  # a page-11 stock-table leader-dot line at ratio 8.9) found genuine
+  # instances up to 0.71. Zero overlap between the two populations at any
+  # value in [0.088, 0.18]. 0.12 sits in the middle of that gap; the
+  # before/after impact count was stable within 5 insertions across the
+  # whole tested range (0.08/0.10/0.12/0.15), so the exact value in this
+  # range is not load-bearing. Restricted to alphabetic pairs specifically
+  # because that is what excluded the page-11 stock-table leader-dot line
+  # (ratio 8.9, digits/periods, not letters) automatically, without a
+  # separate magnitude cap.
+  word_space_gap_ratio: 0.12
 
 render:
   # ~1MP image persisted per page in the bronze layer, for Phase 2's vision

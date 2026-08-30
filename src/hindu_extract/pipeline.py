@@ -56,7 +56,7 @@ def _process_one_page(
 
     if tracer is None:
         chars = list(page.chars)
-        metadata, lines = build_page(page, page_num, config)
+        metadata, lines, word_space_log = build_page(page, page_num, config)
         findings = check_page(page, page_num, metadata.modal_font_size, config)
         vision_image = render_vision_image(page, config.render.vision_target_megapixels)
     else:
@@ -68,10 +68,11 @@ def _process_one_page(
             # caches the underlying extraction so this costs nothing extra -
             # see module docstring for why char_extraction/line_building are
             # timed as two stages without splitting lines.build_page itself.
-            metadata, lines = build_page(page, page_num, config)
+            metadata, lines, word_space_log = build_page(page, page_num, config)
             detail["line_count"] = len(lines)
             detail["single_glyph_lines"] = sum(1 for l in lines if l.flags.single_glyph)
             detail["size_outlier_lines"] = sum(1 for l in lines if l.flags.size_outlier)
+            detail["word_space_insertions"] = len(word_space_log)
         with tracer.stage(page_num, "ligature_canary") as detail:
             findings = check_page(page, page_num, metadata.modal_font_size, config)
             detail["finding_count"] = len(findings)
@@ -84,6 +85,7 @@ def _process_one_page(
         "metadata": metadata.to_dict(),
         "lines": [line.to_dict() for line in lines],
         "canary_findings": [f.to_dict() for f in findings],
+        "word_space_log": [w.to_dict() for w in word_space_log],
     }
     cache.write_cache(cache_dir, page_result_dict, vision_image)
     return page_result_dict, vision_image, False

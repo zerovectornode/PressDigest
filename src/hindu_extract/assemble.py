@@ -104,29 +104,39 @@ def _join_consecutive(
     cleaned = ""
     prev: Line | None = None
     for line in lines:
-        text = line.text
+        # raw uses the literal, uncorrected text (what the Gemini prompt
+        # dump showed - see models.py Line.text); cleaned uses the
+        # word-space-corrected text, since it's the field readers actually
+        # see. The two only ever differ by inserted whitespace (see
+        # lines.py, verify.py check_word_space_correction_fidelity), so
+        # nothing below that inspects a line's first/last character (the
+        # drop-cap/de-hyphenation rules) needs to change - a synthetic
+        # space is never inserted at position 0 or at the very end of a
+        # line's char group, since insertion requires a char on both sides.
+        raw_text = line.text
+        clean_text = line.corrected_text
         if prev is None:
-            raw = text
-            cleaned = text
+            raw = raw_text
+            cleaned = clean_text
         elif prev.flags.single_glyph:
-            raw += _fuse_drop_cap(prev, text)
-            cleaned += _fuse_drop_cap(prev, text)
+            raw += _fuse_drop_cap(prev, raw_text)
+            cleaned += _fuse_drop_cap(prev, clean_text)
         else:
-            raw += " " + text
+            raw += " " + raw_text
             stripped = cleaned.rstrip()
-            if stripped.endswith("-") and text[:1].islower():
-                cleaned = stripped[:-1] + text
+            if stripped.endswith("-") and clean_text[:1].islower():
+                cleaned = stripped[:-1] + clean_text
                 join_log.append(
                     JoinLogEntry(
                         article_id=article_id,
                         field=field_name,
                         prev_line=prev.line_no,
                         next_line=line.line_no,
-                        context=f"{stripped[-24:]}{text[:24]}",
+                        context=f"{stripped[-24:]}{clean_text[:24]}",
                     )
                 )
             else:
-                cleaned = stripped + " " + text
+                cleaned = stripped + " " + clean_text
         prev = line
     return raw, cleaned
 
