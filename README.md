@@ -1,13 +1,3 @@
----
-title: PressDigest
-emoji: 📰
-colorFrom: indigo
-colorTo: blue
-sdk: docker
-app_port: 7860
-pinned: false
----
-
 # PressDigest - newspaper e-paper extraction pipeline + reader
 
 PressDigest extracts individual articles - headline, deck, byline, dateline,
@@ -226,38 +216,36 @@ and an ordinary body-line bbox land in the correct vertical position, not
 mirrored - see design/DESIGN.md "Coordinate mapping" for why that's the
 specific thing worth testing.
 
-### Deploying (Hugging Face Spaces, Docker)
+### Deploying
 
-The YAML frontmatter at the very top of this file is Hugging Face Spaces
-metadata (`sdk: docker`, `app_port: 7860`) - GitHub just renders it as a
-plain block, it has no effect there.
+**This is a private, authenticated personal instance, not a public
+service.** It serves The Hindu's verbatim text and PDF pages - see "A note
+on content and licensing" above - so every deployment of it needs to sit
+behind a login, not a bare public IP.
 
-The Space is deployed from this same repository via a second git remote,
-not a separate copy of the code - GitHub stays the single source of
-truth; redeploying is `git push space main`:
+Current deployment target: a single GCP `e2-micro` VM (Debian 12,
+Always Free tier), no Docker - see `deploy/` (systemd unit, nginx site
+config with mandatory HTTP Basic auth, a first-time `setup.sh`, and an
+idempotent `deploy.sh` you run from your laptop for every update) and
+design/DESIGN.md "Deployment: GCP e2-micro VM" for the full reasoning
+(why the frontend is built locally and shipped prebuilt rather than built
+on the VM, why concurrency is turned down, the cache-header/egress
+budget, and the ownership model behind root owning the code/venv while
+only `data/` belongs to the service's own user).
 
-```bash
-git remote add space https://huggingface.co/spaces/<user>/<space>
-git push space main
-```
+A `Dockerfile` also still exists at the repo root (originally built for
+Hugging Face Spaces, before HF discontinued free Docker Space hosting) -
+it's a correct, self-contained way to run the app anywhere Docker *is*
+available, kept as an alternative rather than deleted, but it is not what
+the currently-deployed instance runs on.
 
-The `Dockerfile` at the repo root builds the frontend (`npm run build`)
-and the Python package into one image; FastAPI serves the built frontend
-and the `/api/*` routes from the same process on port 7860 (see
-`hindu_extract/api/main.py`'s SPA fallback route - StaticFiles alone
-doesn't 404-fallback client-side routes like `/pipeline` to
-`index.html`, so there's an explicit catch-all for that).
-
-Set `GEMINI_API_KEY` under the Space's Settings -> Secrets (never commit
-it, never bake it into the image - see `.env.example`).
-
-**Data is ephemeral by design on this deployment.** There's no external
-store configured; everything under `data/` (bronze/gold/cache/trace) lives
-on the container's own disk and is wiped on every rebuild or restart. A
-full 18-page edition costs one extraction run (well under the 500
-requests/day Gemini quota) and takes well under two minutes, so
-re-uploading after a restart is an accepted tradeoff, not a bug - the
-Dashboard's empty-editions state is what a fresh container shows.
+**Data is ephemeral by design.** There's no external store configured;
+everything under `data/` (bronze/gold/cache/trace) lives on the machine's
+own disk. A full 18-page edition costs one extraction run (well under the
+500 requests/day Gemini quota) and takes well under two minutes, so
+re-uploading after a VM restart is an accepted tradeoff, not a bug - the
+Dashboard's empty-editions state is what a freshly (re)started instance
+shows.
 
 ## Configuration
 
@@ -265,6 +253,15 @@ All thresholds, paths, and the pipeline version live in
 [config/default.yaml](config/default.yaml), never hardcoded - each
 threshold's comment documents how it was calibrated. Pass
 `--config path/to/other.yaml` to any command to override.
+
+A couple of values are also environment-overridable on top of the YAML
+(checked in `config.py`'s `load_config`, not a separate production config
+file - see design/DESIGN.md "Deployment: GCP e2-micro VM" for why):
+
+- `HINDU_EXTRACT_MAX_CONCURRENT` - overrides `concurrency.max_concurrent`
+  (the e2-micro deployment sets this to 2, down from the default 4, as a
+  safety margin against its shared-core CPU).
+- `LOG_LEVEL` - the API process's log level (`INFO` by default).
 
 ## Tests
 

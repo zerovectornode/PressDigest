@@ -5,6 +5,7 @@ YAML file, not in code. See config/default.yaml for calibration notes.
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -24,7 +25,6 @@ class Thresholds:
 
 @dataclass(frozen=True)
 class RenderConfig:
-    vision_target_megapixels: float
     hires_dpi: int
 
 
@@ -115,10 +115,35 @@ class Config:
         return self.project_root / self.paths.ranking_cache_root
 
 
+
+# Environment-variable overrides applied on top of the YAML, checked at
+# load time rather than baked into a separate production.yaml - see
+# design/DESIGN.md "Deployment: GCP e2-micro VM" for why a second full
+# config file (mostly identical to default.yaml) was rejected in favor of
+# this: no risk of the two files drifting apart on everything except the
+# one value production actually needs to differ on. HINDU_EXTRACT_MAX_
+# CONCURRENT is the one the e2-micro deployment sets (2, down from 4) as
+# a safety margin against its shared-core CPU; unset in local dev, so
+# default.yaml's own value is used unchanged.
+_ENV_OVERRIDES = {
+    "HINDU_EXTRACT_MAX_CONCURRENT": ("concurrency", "max_concurrent", int),
+}
+
+
+def _apply_env_overrides(raw: dict) -> dict:
+    for env_var, (section, key, cast) in _ENV_OVERRIDES.items():
+        value = os.environ.get(env_var)
+        if value is None:
+            continue
+        raw = {**raw, section: {**raw[section], key: cast(value)}}
+    return raw
+
+
 def load_config(path: Path | None = None) -> Config:
     config_path = Path(path) if path else DEFAULT_CONFIG_PATH
     with open(config_path, "r", encoding="utf-8") as f:
         raw = yaml.safe_load(f)
+    raw = _apply_env_overrides(raw)
 
     project_root = config_path.resolve().parents[1]
 

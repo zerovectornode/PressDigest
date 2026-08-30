@@ -1,0 +1,27 @@
+[Unit]
+Description=PressDigest (uvicorn)
+After=network.target
+
+[Service]
+Type=simple
+User=pressdigest
+Group=pressdigest
+WorkingDirectory=/opt/pressdigest/app
+EnvironmentFile=/etc/pressdigest/pressdigest.env
+ExecStart=/opt/pressdigest/venv/bin/uvicorn hindu_extract.api.main:app --host 127.0.0.1 --port 8000
+Restart=on-failure
+RestartSec=5
+
+# Hardening. The service only ever needs to write under data/ (uploads,
+# bronze, gold, cache, trace - see config/default.yaml paths:) - ReadWritePaths
+# is the actual enforcement boundary, on top of (not instead of) the
+# ownership set up by setup.sh. EnvironmentFile above is read by systemd
+# itself (as root) before the process drops to User=pressdigest, so the
+# secret in it never needs to be readable by this user directly.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/pressdigest/app/data
+
+[Install]
+WantedBy=multi-user.target

@@ -49,18 +49,23 @@ from hindu_extract.trace import RunTracer, new_run_id
 config = load_config()
 _FRONTEND_DIST = config.project_root / "frontend" / "dist"
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+_log_level_name = os.environ.get("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, _log_level_name, logging.INFO),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
 _logger = logging.getLogger("hindu_extract.startup")
 
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
-    """Runs once per container boot. This deployment has no local Docker
-    verification (see design/DESIGN.md/README "Deploying") - iterating on
-    a misconfigured environment happens entirely against HF's build/runtime
-    logs, so a silent path/permission problem (data dir not writable, a
-    dependency missing its expected version) needs to be visible here
-    rather than surfacing later as an opaque 500 on first upload."""
+    """Runs once per process start. Neither deployment target this has run
+    on so far (Hugging Face Spaces, then a bare GCP VM - see design/
+    DESIGN.md "Deployment") has had a local environment to iterate
+    against, so a silent misconfiguration (data dir not writable, a
+    dependency missing its expected version, a concurrency override that
+    didn't take) needs to be visible in the first few log lines rather
+    than surfacing later as an opaque 500 on first upload."""
     data_dir = config.project_root / "data"
     data_dir.mkdir(parents=True, exist_ok=True)
     writable = os.access(data_dir, os.W_OK)
@@ -74,10 +79,17 @@ async def _lifespan(app: FastAPI):
             versions.append(f"{pkg}=MISSING")
 
     _logger.info("python=%s", sys.version.split()[0])
+    _logger.info("log_level=%s", _log_level_name)
     _logger.info("project_root=%s", config.project_root)
     _logger.info("data_dir=%s writable=%s", data_dir, writable)
     _logger.info("frontend_dist=%s exists=%s", _FRONTEND_DIST, _FRONTEND_DIST.is_dir())
     _logger.info("packages: %s", ", ".join(versions))
+    _logger.info(
+        "concurrency: max_concurrent=%d requests_per_minute=%d tokens_per_minute=%d",
+        config.concurrency.max_concurrent,
+        config.concurrency.requests_per_minute,
+        config.concurrency.tokens_per_minute,
+    )
     if not writable:
         _logger.error("data_dir %s is NOT writable - uploads/extraction will fail", data_dir)
 

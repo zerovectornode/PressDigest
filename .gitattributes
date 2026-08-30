@@ -1,0 +1,7 @@
+# deploy/ is rsynced verbatim to a Linux VM (see deploy/deploy.sh) - a
+# CRLF line ending on the #!/usr/bin/env bash shebang line breaks the
+# interpreter lookup outright on Linux. Force LF regardless of the
+# committing machine's core.autocrlf (this repo has been developed on
+# Windows, where autocrlf=true would otherwise reintroduce CRLF on
+# checkout).
+deploy/* text eol=lf

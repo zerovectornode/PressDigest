@@ -1183,9 +1183,111 @@ cold-start retry logic doesn't touch that.
 
 **Remote strategy: a second git remote on this same repository**, not a
 separate deploy repo - `git push space main` redeploys exactly what's on
-GitHub, with no second place for the code to drift from. The tradeoff is
-cosmetic: HF Spaces requires the Docker/port configuration as YAML
-frontmatter at the top of `README.md` specifically (no alternate
-filename), so that block now appears at the top of the GitHub-facing
-README too - GitHub renders it as an inert text block, not a functional
-problem, just a few extra lines above the real content.
+GitHub, with no second place for the code to drift from. The tradeoff was
+cosmetic (HF Spaces requires the Docker/port configuration as YAML
+frontmatter at the top of `README.md` specifically, so that block
+appeared at the top of the GitHub-facing README too) - moot now: HF
+discontinued free Docker Space hosting shortly after this was written,
+before the Space itself was ever created, so the frontmatter was removed
+from README.md again and the actual deployment moved to a GCP VM - see
+"Deployment: GCP e2-micro VM" below. Everything above this point in this
+section (the Dockerfile, the SPA-fallback bug it surfaced, the cold-start
+gate) remains accurate and the `Dockerfile` is still in the repo as a
+working alternative for anywhere Docker *is* available - it's just no
+longer what's actually deployed.
+
+## Deployment: GCP e2-micro VM
+
+No Docker (a constraint of the deploying machine, not a technical
+requirement - the app has none of its own), and no local way to test any
+of this before it runs on the real VM either, the same situation as the
+HF attempt above. Bare VM: systemd runs uvicorn directly, nginx reverse-
+proxies and terminates Basic Auth in front of it. Every file lives under
+`deploy/` (`pressdigest.service`, `nginx-pressdigest.conf`, `setup.sh`,
+`deploy.sh`, `pressdigest.env.example`).
+
+**The frontend is built locally, never on the VM.** `e2-micro` has 1GB
+RAM (shared-core CPU on top of that); `npm run build`'s toolchain
+(esbuild/rollup, both memory-hungry) is a real OOM risk there, and there's
+nothing gained by building on a weaker machine than the one already doing
+it locally. `deploy.sh` runs `npm run build` on the laptop and ships only
+the resulting `frontend/dist/` - never `node_modules`, never a build step
+that has to succeed on the VM.
+
+**Ownership: root owns the code and venv, only `data/` belongs to the
+service's own user.** This resolves a real conflict rather than being an
+arbitrary choice: a setuptools *editable* install (`pip install -e`, kept
+for the same `Path(__file__)`-anchored config-path resolution reason as
+the earlier Docker work) writes an `egg-info` directory back into the
+source tree, which needs the installing user to have write access to
+that tree - if `pressdigest` (the low-privilege service user) owned the
+code, either every deploy would need to run pip as that user with a
+separate permission dance, or the deploy step would need root anyway and
+fight the ownership it just set. Simplest resolution: `deploy.sh`'s rsync
+runs as root on the remote side (`--rsync-path="sudo rsync"`), pip install
+runs as root too, and only `/opt/pressdigest/app/data` - explicitly
+excluded from rsync's reach - is chowned to `pressdigest` once by
+`setup.sh` and never touched again. The systemd unit's own hardening
+(`ProtectSystem=strict`, `ReadWritePaths=/opt/pressdigest/app/data`) is
+the actual write-access enforcement; the Unix ownership is what makes
+that boundary line up with a directory the service can still write to at
+all.
+
+**Concurrency turned down, and made env-overridable rather than forked
+into a second config file.** `config/default.yaml`'s
+`concurrency.max_concurrent: 4` was calibrated against local runs on a
+real (non-shared-core) CPU; the e2-micro's shared-core vCPUs are a
+materially weaker, noisier-neighbor environment, so production runs at 2
+as a safety margin. Rejected a full `config/production.yaml`: it would
+duplicate default.yaml's ~220 lines of calibration comments almost
+entirely unchanged, for the sake of one differing value, with a real risk
+of the two files silently drifting apart on everything else over time.
+`config.py`'s `load_config` instead checks `HINDU_EXTRACT_MAX_CONCURRENT`
+(and could grow more entries the same way) and overrides just that key
+after loading the YAML - unset in local dev, so default.yaml's own value
+applies unchanged there.
+
+**Cache headers, sized against the tightest real budget: 1GB/month free
+egress**, not CPU or RAM. Vite's build gives every JS/CSS/font asset a
+content-hash filename, so `/assets/*` is cached for a year
+(`Cache-Control: immutable`) - a new build is always a new URL, there is
+no staleness risk. The raw PDF an edition was extracted from never
+changes once uploaded (no edit/replace flow exists), so
+`/api/editions/{id}/pdf` is cached for a week - without this, re-opening
+the same reader session re-downloads a ~20MB PDF every time, which alone
+could exhaust the monthly egress budget in a handful of sessions.
+Static assets are served directly by nginx from disk (`alias`, bypassing
+uvicorn entirely) rather than through the FastAPI catch-all that also
+handles this correctly - not for correctness (both work) but because the
+e2-micro's shared-core CPU shouldn't spend a Python process's cycles on a
+file nginx can serve itself.
+
+**Basic Auth is non-negotiable, at the nginx layer, applied to every
+route** - set at `server` level in `nginx-pressdigest.conf` rather than
+per-location, specifically so a new route added later is protected by
+default instead of needing someone to remember to add auth to it. This
+serves copyrighted newspaper content to a public IP; there is no
+acceptable configuration of this deployment without it.
+
+**TLS: recommended now, not deferred**, despite no domain being owned.
+Basic Auth's credentials are base64-encoded, not encrypted - sent in
+cleartext on every request over plain HTTP, trivially readable by
+anything on the network path. Serving Basic-Auth-protected content over
+HTTP is a real, immediate exposure, not a hardening nice-to-have to get to
+later. Cheapest correct path: a free DNS name from a provider like
+DuckDNS pointed at the VM's (reserved, static) external IP, then
+`certbot --nginx` for a free Let's Encrypt certificate with automatic
+renewal - both zero-cost, and `certbot`'s nginx plugin edits
+`nginx-pressdigest.conf`'s server block in place rather than requiring a
+hand-written HTTPS server block. (Caddy would get automatic TLS with even
+less configuration than certbot, but nginx was the explicit choice here,
+so certbot-on-nginx is the path that doesn't contradict that.)
+
+**Static IP: reserve it.** An external IP costs nothing extra *while
+attached to a running instance* - GCP only bills a reserved static IP
+when it's sitting unattached (e.g. the VM is stopped but the reservation
+wasn't released). This is a long-running, always-on personal service, not
+something stopped and started often, so the practical cost is $0, and a
+stable IP is what makes the DuckDNS-plus-certbot TLS setup above possible
+at all - an ephemeral IP changes on certain restarts, silently breaking
+the DNS pointer.
