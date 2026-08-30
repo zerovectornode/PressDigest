@@ -35,6 +35,8 @@ def _issues_by_article(validation: ValidationResult) -> dict[str, list[str]]:
         issues.setdefault(o.article_id_b, []).append(
             f"body range overlaps {o.article_id_a}: {o.range_b} vs {o.range_a}"
         )
+    for h in validation.headline_quality_issues:
+        issues.setdefault(h.article_id, []).append(f"headline_quality: {h.detail}")
     return issues
 
 

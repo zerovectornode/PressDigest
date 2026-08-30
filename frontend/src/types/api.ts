@@ -66,6 +66,8 @@ export interface EditionDetailOut {
 export interface ArticleOut {
   article_id: string;
   page: number;
+  section_kicker: string;
+  section_kicker_raw: string;
   headline: string;
   headline_raw: string;
   deck: string[];

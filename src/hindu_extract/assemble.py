@@ -212,6 +212,8 @@ def _fragment_bboxes(lines: list[Line]) -> list[Bbox]:
 class AssembledArticle:
     article_id: str
     page: int
+    section_kicker: str
+    section_kicker_raw: str
     headline: str
     headline_raw: str
     deck: list[str]
@@ -236,6 +238,8 @@ class AssembledArticle:
         return {
             "article_id": self.article_id,
             "page": self.page,
+            "section_kicker": self.section_kicker,
+            "section_kicker_raw": self.section_kicker_raw,
             "headline": self.headline,
             "headline_raw": self.headline_raw,
             "deck": self.deck,
@@ -286,6 +290,7 @@ def assemble_articles(
             all_lines.extend(field_lines)
             return raw, cleaned
 
+        section_kicker_raw, section_kicker = field("section_kicker", "section_kicker")
         headline_raw, headline = field("headline", "headline")
         deck_raw, deck = field_list("deck", "deck")
         byline_raw, byline = field("byline", "byline")
@@ -305,6 +310,8 @@ def assemble_articles(
             AssembledArticle(
                 article_id=article_id,
                 page=page_num,
+                section_kicker=section_kicker,
+                section_kicker_raw=section_kicker_raw,
                 headline=headline,
                 headline_raw=headline_raw,
                 deck=deck,

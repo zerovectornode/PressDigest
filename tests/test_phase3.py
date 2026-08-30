@@ -16,7 +16,7 @@ def make_line(line_no, text, size=9.0, single_glyph=False, size_outlier=False):
 
 
 LINES = [
-    make_line(1, "Big Headline", size=40.0, size_outlier=True),
+    make_line(1, "Very Big Headline", size=40.0, size_outlier=True),
     make_line(2, "By a Reporter"),
     make_line(3, "CITY"),
     make_line(4, "The quick brown fox"),
@@ -43,7 +43,7 @@ def test_ok_when_checksums_match_and_no_overlap():
         "articles": [
             {
                 "article_id": "a1",
-                "headline": {"start": 1, "end": 1, "start_words": "Big Headline"},
+                "headline": {"start": 1, "end": 1, "start_words": "Very Big Headline"},
                 "body": {"start": 4, "end": 5, "start_words": "The quick", "end_words": "lazy dog."},
                 **_empty_fields(byline={"start": 2, "end": 2, "start_words": "By a"}),
             }
@@ -62,7 +62,7 @@ def test_checksum_normalizes_case_and_whitespace():
         "articles": [
             {
                 "article_id": "a1",
-                "headline": {"start": 1, "end": 1, "start_words": "  BIG   headline  "},
+                "headline": {"start": 1, "end": 1, "start_words": "  VERY   big  Headline  "},
                 "body": {"start": 4, "end": 5, "start_words": "the QUICK", "end_words": "LAZY   dog."},
                 **_empty_fields(),
             }
@@ -97,7 +97,7 @@ def test_checksum_mismatch_on_wrong_end_words_catches_off_by_n():
         "articles": [
             {
                 "article_id": "a1",
-                "headline": {"start": 1, "end": 1, "start_words": "Big Headline"},
+                "headline": {"start": 1, "end": 1, "start_words": "Very Big Headline"},
                 "body": {"start": 4, "end": 4, "start_words": "The quick", "end_words": "lazy dog."},
                 **_empty_fields(),
             }
@@ -114,8 +114,8 @@ def test_contiguity_flags_headline_scale_line_inside_body_range():
         "articles": [
             {
                 "article_id": "a1",
-                "headline": {"start": 1, "end": 1, "start_words": "Big Headline"},
-                "body": {"start": 1, "end": 5, "start_words": "Big Headline", "end_words": "lazy dog."},
+                "headline": {"start": 1, "end": 1, "start_words": "Very Big Headline"},
+                "body": {"start": 1, "end": 5, "start_words": "Very Big Headline", "end_words": "lazy dog."},
                 **_empty_fields(),
             }
         ]
@@ -151,7 +151,7 @@ def test_overlap_detected_between_two_bodies():
         "articles": [
             {
                 "article_id": "a1",
-                "headline": {"start": 1, "end": 1, "start_words": "Big Headline"},
+                "headline": {"start": 1, "end": 1, "start_words": "Very Big Headline"},
                 "body": {"start": 4, "end": 5, "start_words": "The quick", "end_words": "lazy dog."},
                 **_empty_fields(),
             },
@@ -282,12 +282,167 @@ def test_checksum_still_rejects_a_missing_drop_cap_letter_in_the_actual_text():
     assert any(m.field == "body" for m in result.checksum_mismatches)
 
 
+def test_headline_quality_flags_a_single_character_headline():
+    # The real bug found live (page 6): a drop cap ("W", "T", "I") mistaken
+    # for the headline. lines[0] here plays that role - single_glyph,
+    # size_outlier, one character.
+    lines = [
+        make_line(1, "W", size=37.0, single_glyph=True, size_outlier=True),
+        make_line(2, "eeks after calling off the visit"),
+    ]
+    parsed = {
+        "articles": [
+            {
+                "article_id": "a1",
+                "headline": {"start": 1, "end": 1, "start_words": "W"},
+                "body": {"start": 1, "end": 2, "start_words": "W", "end_words": "the visit"},
+                **_empty_fields(),
+            }
+        ]
+    }
+    result = validate_page(lines, parsed)
+    assert not result.ok
+    assert len(result.headline_quality_issues) == 1
+    issue = result.headline_quality_issues[0]
+    assert issue.article_id == "a1"
+    assert issue.headline_text == "W"
+    assert "single character" in issue.detail
+
+
+def test_headline_quality_flags_drop_cap_fused_with_body_opening():
+    # The other real variant found live (page 6, article 1): the drop cap
+    # fused with the start of body prose reads like the opening clause of
+    # a sentence, not a title - still well under the word-count floor a
+    # real headline is expected to clear... except this one is NOT under
+    # the floor by word count alone (6 words), so this test documents that
+    # the word-count check alone does not catch it - see the live
+    # investigation for why the prompt fix (not validation) is the primary
+    # defense for this specific sub-case.
+    lines = [
+        make_line(1, "P", size=37.0, single_glyph=True, size_outlier=True),
+        make_line(2, "olicing the digital economy requires what"),
+    ]
+    parsed = {
+        "articles": [
+            {
+                "article_id": "a1",
+                "headline": {"start": 1, "end": 2, "start_words": "P"},
+                "body": {"start": 1, "end": 2, "start_words": "P", "end_words": "requires what"},
+                **_empty_fields(),
+            }
+        ]
+    }
+    result = validate_page(lines, parsed)
+    # 6 words - clears the word-count floor, so this specific case is NOT
+    # caught by validation alone (documented, not asserted as a false
+    # negative bug - the prompt fix is what actually prevents this).
+    assert not result.headline_quality_issues
+
+
+def test_headline_quality_flags_headline_shorter_than_three_words():
+    lines = [make_line(1, "Two Words", size=20.0), make_line(2, "body text here")]
+    parsed = {
+        "articles": [
+            {
+                "article_id": "a1",
+                "headline": {"start": 1, "end": 1, "start_words": "Two Words"},
+                "body": {"start": 2, "end": 2, "start_words": "body text", "end_words": "text here"},
+                **_empty_fields(),
+            }
+        ]
+    }
+    result = validate_page(lines, parsed)
+    assert not result.ok
+    assert len(result.headline_quality_issues) == 1
+    assert "2 word(s)" in result.headline_quality_issues[0].detail
+
+
+def test_headline_quality_ok_for_a_real_three_word_headline():
+    result = validate_page(
+        LINES,
+        {
+            "articles": [
+                {
+                    "article_id": "a1",
+                    "headline": {"start": 1, "end": 1, "start_words": "Very Big Headline"},
+                    "body": {"start": 4, "end": 5, "start_words": "The quick", "end_words": "lazy dog."},
+                    **_empty_fields(),
+                }
+            ]
+        },
+    )
+    assert not result.headline_quality_issues
+
+
+def test_headline_quality_flags_an_all_caps_section_kicker():
+    # The real bug found live (page 7): "GROUND ZERO" (39.9pt, ALL-CAPS
+    # section kicker) mistaken for the headline instead of the real title
+    # "After the disaster" below it.
+    lines = [make_line(1, "GROUND ZERO", size=39.9), make_line(2, "some body text here")]
+    parsed = {
+        "articles": [
+            {
+                "article_id": "a1",
+                "headline": {"start": 1, "end": 1, "start_words": "GROUND ZERO"},
+                "body": {"start": 2, "end": 2, "start_words": "some body", "end_words": "text here"},
+                **_empty_fields(),
+            }
+        ]
+    }
+    result = validate_page(lines, parsed)
+    assert not result.ok
+    assert len(result.headline_quality_issues) == 1
+    issue = result.headline_quality_issues[0]
+    assert issue.headline_text == "GROUND ZERO"
+    assert "section kicker" in issue.detail
+
+
+def test_headline_quality_ok_for_a_longer_all_caps_headline():
+    # "LETTERS TO THE EDITOR" (found live, page 6) is a genuine, legitimate
+    # ALL-CAPS headline for a letters roundup, not a kicker - 4 words is
+    # above the kicker-like threshold, so it must not be flagged.
+    lines = [make_line(1, "LETTERS TO THE EDITOR", size=20.0), make_line(2, "a reader writes in")]
+    parsed = {
+        "articles": [
+            {
+                "article_id": "a1",
+                "headline": {"start": 1, "end": 1, "start_words": "LETTERS TO"},
+                "body": {"start": 2, "end": 2, "start_words": "a reader", "end_words": "writes in"},
+                **_empty_fields(),
+            }
+        ]
+    }
+    result = validate_page(lines, parsed)
+    assert not result.headline_quality_issues
+
+
+def test_headline_quality_ok_for_a_short_headline_that_is_not_all_caps():
+    # "Doublespeak" (found live, page 6) is a genuine one-word title-case
+    # headline - flagged by the separate word-count check (a real, known
+    # trade-off already accepted), but must NOT additionally match the
+    # ALL-CAPS kicker pattern, which is specifically scoped to all-caps text.
+    lines = [make_line(1, "Doublespeak", size=20.0), make_line(2, "weeks after the visit")]
+    parsed = {
+        "articles": [
+            {
+                "article_id": "a1",
+                "headline": {"start": 1, "end": 1, "start_words": "Doublespeak"},
+                "body": {"start": 2, "end": 2, "start_words": "weeks after", "end_words": "the visit"},
+                **_empty_fields(),
+            }
+        ]
+    }
+    result = validate_page(lines, parsed)
+    assert len(result.headline_quality_issues) == 1
+    assert "section kicker" not in result.headline_quality_issues[0].detail
+
+
 def test_coverage_report_reflects_unassigned_lines():
     parsed = {
         "articles": [
             {
                 "article_id": "a1",
-                "headline": {"start": 1, "end": 1, "start_words": "Big Headline"},
+                "headline": {"start": 1, "end": 1, "start_words": "Very Big Headline"},
                 "body": {"start": 4, "end": 5, "start_words": "The quick", "end_words": "lazy dog."},
                 **_empty_fields(),
             }

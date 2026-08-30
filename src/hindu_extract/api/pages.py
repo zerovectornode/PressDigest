@@ -55,6 +55,8 @@ def get_page_articles(config: Config, edition: str, date: str, page_num: int) ->
             ArticleOut(
                 article_id=a["article_id"],
                 page=a["page"],
+                section_kicker=a["section_kicker"],
+                section_kicker_raw=a["section_kicker_raw"],
                 headline=a["headline"],
                 headline_raw=a["headline_raw"],
                 deck=a["deck"],

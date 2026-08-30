@@ -60,6 +60,8 @@ class EditionDetailOut(EditionSummaryOut):
 class ArticleOut(BaseModel):
     article_id: str
     page: int
+    section_kicker: str
+    section_kicker_raw: str
     headline: str
     headline_raw: str
     deck: list[str]

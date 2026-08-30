@@ -80,5 +80,9 @@ def group_page(
         ]
         detail["coverage_ratio"] = validation.coverage.coverage_ratio if validation.coverage else None
         detail["boundary_fixups"] = [f.to_dict() for f in boundary_fixups]
+        detail["headline_quality_issues"] = [
+            {"article_id": h.article_id, "headline_text": h.headline_text, "detail": h.detail}
+            for h in validation.headline_quality_issues
+        ]
 
     return GroupingOutcome(parsed=parsed, validation=validation, usage=usage, boundary_fixups=boundary_fixups)

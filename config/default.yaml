@@ -131,7 +131,20 @@ gemini:
   # Bump this to invalidate ALL cached Gemini responses (it's part of the
   # cache key alongside the line dump, model id, thinking_level, and
   # max_output_tokens) without needing to change the model or re-run Phase 1.
-  prompt_version: "v4"
+  # v5: line dump gained a D/- drop-cap flag column, and the system prompt
+  # now explicitly excludes drop caps from "largest font = headline" -
+  # fixes the page-6 bug where a drop cap was mistaken for a headline (see
+  # design/DESIGN.md "Standing rule: exclude single_glyph/size_outlier from
+  # font-size comparisons"). A v4-cached response reflects the old dump
+  # format the model never saw the D column in, so it must not be served
+  # under v5's key.
+  # v6: added a `section_kicker` field and an explicit rule that ALL-CAPS
+  # standing-head labels (e.g. "GROUND ZERO") are furniture, not headlines
+  # - third occurrence of "largest font wins" picking up page furniture
+  # (drop caps, then this). Found live on page 7: the fix for drop caps
+  # alone still let a 39.9pt section kicker outrank the real ~20pt
+  # headline, losing the real headline and deck entirely.
+  prompt_version: "v6"
 
 concurrency:
   # Real quotas: 500 requests/day, 15 requests/minute, 250,000 tokens/minute.

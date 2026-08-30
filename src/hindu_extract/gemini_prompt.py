@@ -61,6 +61,7 @@ RESPONSE_JSON_SCHEMA = {
                 "type": "object",
                 "properties": {
                     "article_id": {"type": "string"},
+                    "section_kicker": _NULLABLE_LINE_RANGE,
                     "headline": _LINE_RANGE,
                     "deck": {"type": "array", "items": _LINE_RANGE},
                     "byline": _NULLABLE_LINE_RANGE,
@@ -73,6 +74,7 @@ RESPONSE_JSON_SCHEMA = {
                 },
                 "required": [
                     "article_id",
+                    "section_kicker",
                     "headline",
                     "deck",
                     "byline",
@@ -119,14 +121,46 @@ Unrelated stories' teasers can sit between two pieces of the same story's \
 own furniture (e.g. a headline at one line number and its deck twenty \
 lines later, with other stories' teasers in between). This is why deck \
 and caption are LISTS of ranges - use more than one entry if the deck or \
-captions are split into separate chunks. headline, byline, and dateline \
-are single ranges (byline/dateline may be null if the article has none).
+captions are split into separate chunks. headline, byline, dateline, and \
+section_kicker are single ranges (byline/dateline/section_kicker may be \
+null if the article has none).
+
+SECTION KICKERS / STANDING HEADS ARE NOT HEADLINES: many stories carry a \
+short label above the real headline naming the recurring section or \
+theme the story belongs to - e.g. GROUND ZERO, STRIFE-TORN STATE, NATO ON \
+EDGE, PLAYCOM SUMMIT. Recognize one by its shape, not just its wording: \
+ALL-CAPS, very short (1-3 words), and often in a visibly different font \
+from the headline right below it (frequently similar to or even larger \
+than the real headline's own font size - font size ALONE never tells you \
+which line is the headline, see DROP CAPS ARE NOT HEADLINES above for the \
+other way that goes wrong). A kicker is furniture, not a title - never \
+select one as `headline`. Put it in `section_kicker` if you can identify \
+it as one; otherwise leave it out of every range entirely, the same as \
+any other line that belongs to no field.
+
+DROP CAPS ARE NOT HEADLINES: a line marked with a leading `D` (see the \
+format below) is a drop cap - a single oversized capital letter that \
+begins a story's BODY TEXT, purely a print styling choice, never a title. \
+It fuses with zero separator onto the very next line to form the first \
+word of the body (e.g. "P" + "olicing the..." = "Policing the..."). \
+Drop caps are frequently the single LARGEST font size on the page - \
+sometimes larger than every real headline on it - so when judging which \
+line is "the largest" for a story, EXCLUDE every `D`-marked line from \
+that comparison entirely. A single letter is never a headline, and \
+neither is a drop cap fused with the first few words of body prose that \
+follows it - if a candidate headline reads like the opening clause of a \
+sentence rather than a title, you have picked the drop-cap/body-opening \
+by mistake; look for the real title elsewhere near it instead.
 
 DISTINGUISHING HEADLINE FROM DECK: the main headline is usually the \
-largest font size for that story and short (a few words to one line). A \
-deck/strap line is typically smaller and reads as one or two full \
-sentences. When multiple large-font lines are near each other, use both \
-font size and length to decide which is the headline.
+largest font size for that story EXCLUDING any drop cap AND any section \
+kicker (see both above), and short (a few words to one line). A \
+deck/strap line is typically smaller than the headline and reads as one \
+or two full sentences. When multiple large-font lines are near each \
+other, use both font size and length to decide which is the headline - \
+and remember the headline is very often BETWEEN the drop-cap-led body \
+and the rest of that story's furniture, not immediately adjacent to the \
+drop cap at all.
 
 CONTINUATION MARKERS: a line like "CONTINUED ON" / a page-number line \
 marks that the article is truncated here and continues on another page. \
@@ -145,12 +179,16 @@ ads, furniture, tables, teasers). Focus entirely on getting real articles'
 boundaries right.
 
 Lines are listed one per row as:
-  L<line_no>|<font_size>|<text>
+  L<line_no>|<font_size>|<D or ->|<text>
+The third column is `D` if this line is a drop cap (see DROP CAPS ARE NOT \
+HEADLINES above), `-` otherwise - a flag you can see directly rather than \
+having to infer from size alone.
 """
 
 
 def format_line_row(line: Line) -> str:
-    return f"L{line.line_no:04d}|{line.font_profile.size:.1f}|{line.text}"
+    is_drop_cap = "D" if (line.flags.single_glyph and line.flags.size_outlier) else "-"
+    return f"L{line.line_no:04d}|{line.font_profile.size:.1f}|{is_drop_cap}|{line.text}"
 
 
 def build_user_prompt(lines: list[Line], page_num: int, modal_font_size: float) -> str:

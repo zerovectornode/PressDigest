@@ -712,3 +712,78 @@ pages' furniture, none of it wrongly captured). Both assembled bodies read
 as fully correct, continuous, grammatically coherent prose end to end -
 "meetings" present, "meetNings" nowhere, drop-cap "N" leading the body
 with no stray space.
+
+## Standing rule: font size alone never identifies a headline
+
+This has now bitten three times, via two different variants of the same
+underlying mistake: treating a piece of page furniture as a normal
+candidate when deciding what's "biggest" or "the headline" on the page.
+Drop caps and section kickers must both be excluded from that judgment -
+font size alone is not sufficient, ever.
+
+**First bite (Phase 1):** the page's modal/outlier font-size calculation
+has to exclude single_glyph lines, or a drop cap (routinely 3-4x body
+size) skews the distribution used to detect genuine headline-scale text.
+
+**Second bite (Phase 2, found live via the ranking feature):** the
+boundary-finding prompt told the model "the headline is usually the
+largest font size for that story," with no exclusion for drop caps. On
+page 6 (The Hindu's op-ed page), every piece opens with a 37pt drop cap -
+larger than any of that page's real ~13-21pt titles - so the model
+picked the drop cap as the "headline" for 3 of 4 op-eds (literally a
+single letter: "W", "T", "I"), and for the 4th, the drop cap fused with
+the start of body prose ("Policing the digital economy requires what...",
+which is the opening clause of the body, not a title at all). The real
+titles ended up folded into `deck` instead. Confirmed by inspecting the
+raw bronze lines directly (line 8: 37pt, single_glyph, "P"; line 9: 9pt,
+"olicing the digital economy requires what...") and by pulling the exact
+prompt the ranking call received from the trace DB - it genuinely said
+`headline: W`.
+
+**The fix, applied here for good:** any time a line's font size is being
+compared to find "the biggest" or "the headline," single_glyph +
+size_outlier lines (drop caps) must be excluded from that comparison
+first. `gemini_prompt.py`'s dump format now marks each line with an
+explicit `D`/`-` flag so the model can see the flag rather than infer it
+from size, and the system prompt states outright that a drop cap is never
+a headline and that a single letter is never a headline. `phase3.py` adds
+a backstop validation check (`_check_headline_quality`): a resolved
+headline of a single character, or fewer than ~3 words, is flagged
+`needs_review` rather than trusted - this specific bug would have been
+caught automatically had this check existed from the start.
+
+**Third bite (Phase 2, found live on page 7, immediately after fixing the
+second):** excluding drop caps alone wasn't enough. Page 7's real headline
+("After the disaster") sits below a 39.9pt ALL-CAPS section kicker
+("GROUND ZERO") that is NOT a drop cap (not single_glyph) but is still
+larger than the real ~20pt headline - the drop-cap fix correctly stopped
+the model from picking the drop cap, but it then picked the kicker
+instead, losing the real headline and an entire deck. Confirmed the same
+way as the second bite: read the raw bronze lines directly (line 7:
+39.9pt, not single_glyph, "GROUND ZERO"; line 8: 52.1pt, single_glyph,
+the real drop cap "T") and the gold JSON that resulted (`headline: "GROUND
+ZERO"`, `deck: []`). Checked all 18 pages for the same shape (an ALL-CAPS,
+<=3-word headline) - isolated to this one page, not systemic, but the
+underlying rule was still wrong in general.
+
+**The fix, generalised rather than special-cased a second time:**
+`gemini_prompt.py` now has a "SECTION KICKERS / STANDING HEADS ARE NOT
+HEADLINES" rule describing the *shape* of a kicker (ALL-CAPS, 1-3 words,
+often a font size that rivals or exceeds the real headline) with concrete
+examples from this edition (GROUND ZERO, STRIFE-TORN STATE, NATO ON EDGE,
+PLAYCOM SUMMIT), and a new `section_kicker` field so a correctly-identified
+kicker has somewhere to go instead of either being dropped or capturing
+the headline slot. `phase3.py`'s `_check_headline_quality` gained a second
+condition alongside the drop-cap one: a headline that is ALL-CAPS and 3
+words or fewer is flagged `needs_review` as a likely kicker - this would
+have caught the page-7 bug automatically, the same way the single-character
+check already catches the drop-cap bug.
+
+**Watch for this a fourth time:** anywhere else a prompt or a heuristic
+reasons about "the biggest font on the page/story" is a candidate for the
+same failure mode. Drop caps and section kickers are both deliberately,
+structurally larger than they "should" be for their semantic role - that's
+the whole point of both - so either will reliably beat the actual headline
+in a naive size comparison. Font size is evidence toward a headline
+candidate, never proof by itself.
+

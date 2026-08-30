@@ -122,6 +122,13 @@ class OverlapIssue:
 
 
 @dataclass(frozen=True)
+class HeadlineQualityIssue:
+    article_id: str
+    headline_text: str
+    detail: str
+
+
+@dataclass(frozen=True)
 class CoverageReport:
     total_lines: int
     covered_lines: int
@@ -134,6 +141,7 @@ class ValidationResult:
     checksum_mismatches: tuple[ChecksumMismatch, ...] = field(default_factory=tuple)
     contiguity_issues: tuple[ContiguityIssue, ...] = field(default_factory=tuple)
     overlap_issues: tuple[OverlapIssue, ...] = field(default_factory=tuple)
+    headline_quality_issues: tuple[HeadlineQualityIssue, ...] = field(default_factory=tuple)
     coverage: CoverageReport | None = None
 
 
@@ -232,6 +240,67 @@ def _check_body_contiguity(article_id: str, body_range: dict, lines_by_no: dict[
     return issues
 
 
+_MIN_HEADLINE_WORDS = 3
+_MAX_KICKER_LIKE_WORDS = 3
+
+
+def _check_headline_quality(
+    article_id: str, headline_range: dict, lines_by_no: dict[int, Line]
+) -> list[HeadlineQualityIssue]:
+    """Catches two now-confirmed page-furniture-mistaken-for-headline
+    patterns, both stemming from the same root cause (font size alone
+    never identifies a headline - see design/DESIGN.md "Standing rule: font
+    size alone never identifies a headline"):
+
+    1. Drop caps (found live on page 6): a headline resolving to a single
+       character, or to fewer words than a real title would ever have, is
+       a strong signal the model picked the drop cap (or the drop cap
+       fused with the start of body prose) instead of the real title.
+    2. Section kickers / standing heads (found live on page 7, e.g.
+       "GROUND ZERO"): an ALL-CAPS headline of 3 words or fewer is a
+       strong signal the model picked a section label instead of the real
+       title below it - kickers are almost always short and all-caps,
+       real headlines almost never are.
+
+    Both flagged as needs_review, never used to fail the page - the
+    boundary might still be entirely usable for every other field."""
+    start, end = headline_range.get("start"), headline_range.get("end")
+    if start is None or end is None:
+        return []
+    _raw, cleaned = _slice_texts(lines_by_no, start, end)
+    stripped = cleaned.strip()
+    if len(stripped) <= 1:
+        return [
+            HeadlineQualityIssue(
+                article_id,
+                stripped,
+                f"headline (L{start}-{end}) is a single character {stripped!r} - almost "
+                f"certainly a drop cap mistaken for a headline",
+            )
+        ]
+    word_count = len(stripped.split())
+    if stripped.isupper() and word_count <= _MAX_KICKER_LIKE_WORDS:
+        return [
+            HeadlineQualityIssue(
+                article_id,
+                stripped,
+                f"headline (L{start}-{end}) is ALL-CAPS and only {word_count} word(s) "
+                f"({stripped!r}) - looks like a section kicker/standing head mistaken for "
+                f"a headline, not a real title",
+            )
+        ]
+    if word_count < _MIN_HEADLINE_WORDS:
+        return [
+            HeadlineQualityIssue(
+                article_id,
+                stripped,
+                f"headline (L{start}-{end}) is only {word_count} word(s) ({stripped!r}) - "
+                f"shorter than a real headline is expected to be",
+            )
+        ]
+    return []
+
+
 def _check_overlaps(articles: list[dict]) -> list[OverlapIssue]:
     bodies = []
     for a in articles:
@@ -251,6 +320,8 @@ def _check_overlaps(articles: list[dict]) -> list[OverlapIssue]:
 
 def _all_ranges(article: dict) -> list[dict]:
     ranges = []
+    if article.get("section_kicker"):
+        ranges.append(article["section_kicker"])
     if article.get("headline"):
         ranges.append(article["headline"])
     if article.get("body"):
@@ -281,12 +352,18 @@ def validate_page(lines: list[Line], parsed: dict) -> ValidationResult:
 
     checksum_mismatches: list[ChecksumMismatch] = []
     contiguity_issues: list[ContiguityIssue] = []
+    headline_quality_issues: list[HeadlineQualityIssue] = []
 
     for article in articles:
         article_id = article.get("article_id", "?")
 
+        if article.get("section_kicker"):
+            _check_range_checksum(
+                article_id, "section_kicker", article["section_kicker"], lines_by_no, checksum_mismatches, False
+            )
         if article.get("headline"):
             _check_range_checksum(article_id, "headline", article["headline"], lines_by_no, checksum_mismatches, False)
+            headline_quality_issues.extend(_check_headline_quality(article_id, article["headline"], lines_by_no))
         for i, deck in enumerate(article.get("deck") or []):
             _check_range_checksum(article_id, f"deck[{i}]", deck, lines_by_no, checksum_mismatches, False)
         if article.get("byline"):
@@ -302,11 +379,17 @@ def validate_page(lines: list[Line], parsed: dict) -> ValidationResult:
     overlap_issues = _check_overlaps(articles)
     coverage = _coverage_report(len(lines), articles)
 
-    ok = not checksum_mismatches and not contiguity_issues and not overlap_issues
+    # A headline-quality issue is flagged the same way every other check
+    # here is (needs_review on the specific article, via
+    # articles_pipeline._issues_by_article) - never a crash, never a reason
+    # to drop the article or its other fields, just a signal worth a human
+    # glance. See design/DESIGN.md "Drop caps are never headlines".
+    ok = not checksum_mismatches and not contiguity_issues and not overlap_issues and not headline_quality_issues
     return ValidationResult(
         ok=ok,
         checksum_mismatches=tuple(checksum_mismatches),
         contiguity_issues=tuple(contiguity_issues),
         overlap_issues=tuple(overlap_issues),
+        headline_quality_issues=tuple(headline_quality_issues),
         coverage=coverage,
     )

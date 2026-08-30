@@ -15,10 +15,24 @@ def make_line(line_no, text, size=9.0, single_glyph=False, size_outlier=False):
     )
 
 
-def test_format_line_row_is_pipe_delimited_with_line_no_and_size():
+def test_format_line_row_is_pipe_delimited_with_line_no_size_and_dropcap_flag():
     line = make_line(1, "hello world", size=9.0)
     row = format_line_row(line)
-    assert row == "L0001|9.0|hello world"
+    assert row == "L0001|9.0|-|hello world"
+
+
+def test_format_line_row_flags_drop_cap_lines():
+    drop_cap = make_line(1, "P", size=37.0, single_glyph=True, size_outlier=True)
+    row = format_line_row(drop_cap)
+    assert row == "L0001|37.0|D|P"
+
+
+def test_format_line_row_does_not_flag_size_outlier_alone_as_drop_cap():
+    # A multi-character headline can be size_outlier without being a drop
+    # cap (single_glyph is what makes it a drop cap specifically).
+    headline = make_line(1, "Big Headline", size=40.0, single_glyph=False, size_outlier=True)
+    row = format_line_row(headline)
+    assert row == "L0001|40.0|-|Big Headline"
 
 
 def test_build_user_prompt_includes_modal_size_header_and_all_lines():
@@ -33,7 +47,7 @@ def test_build_user_prompt_includes_modal_size_header_and_all_lines():
 def test_schema_has_no_free_text_content_fields_only_ranges_and_enums():
     article_props = RESPONSE_JSON_SCHEMA["properties"]["articles"]["items"]["properties"]
 
-    single_range_fields = {"headline", "byline", "dateline"}
+    single_range_fields = {"headline", "byline", "dateline", "section_kicker"}
     for field_name in single_range_fields:
         props = article_props[field_name]["properties"]
         assert set(props.keys()) == {"start", "end", "start_words"}
@@ -57,6 +71,7 @@ def test_schema_required_fields_present_on_every_article():
     article_schema = RESPONSE_JSON_SCHEMA["properties"]["articles"]["items"]
     assert set(article_schema["required"]) == {
         "article_id",
+        "section_kicker",
         "headline",
         "deck",
         "byline",
