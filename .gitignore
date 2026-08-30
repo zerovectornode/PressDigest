@@ -1,0 +1,40 @@
+# --- Copyrighted / licensed source material -------------------------------
+# Never commit a newspaper PDF, or anything derived from one. See README.md
+# "Supplying a PDF" - users must provide their own licensed copy locally.
+*.pdf
+docs/*
+!docs/.gitkeep
+
+# --- Pipeline output/cache/trace - all derived from copyrighted articles ---
+# Every one of these contains verbatim newspaper text (bronze layer, gold
+# JSON, page renders, raw Gemini prompts/responses, the trace DB) or is a
+# throwaway scratch/debug artifact from live runs.
+data/
+
+# --- Secrets ----------------------------------------------------------------
+.env
+.env.*
+!.env.example
+
+# --- Python -------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+*.egg
+
+# --- Frontend -------------------------------------------------------------
+frontend/node_modules/
+frontend/dist/
+.vite/
+
+# --- Editors / OS -----------------------------------------------------------
+.DS_Store
+.idea/
+.vscode/
+!.vscode/extensions.json
+
+# --- Claude Code session-local state (not project content) ------------------
+.claude/

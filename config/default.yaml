@@ -1,0 +1,157 @@
+# Phase 1 configuration. No thresholds or paths belong in code — only here.
+# Calibration notes reference measurements taken directly on docs/Newspaper.pdf
+# (18-page The Hindu Delhi e-paper, 2025-09-13 issue) during initial inspection.
+
+pipeline_version: "2.0.0"  # bumped for the stream-order rebuild (span/unit
+                            # layers replaced by lines - see design/DESIGN.md
+                            # "Stream-order rebuild"); bump this to force
+                            # cache invalidation for ALL pages
+
+paths:
+  bronze_root: "data/bronze"
+  cache_root: "data/cache"
+  gold_root: "data/gold"
+  gemini_cache_root: "data/cache/gemini"
+  raw_pdf_root: "data/raw"
+  trace_db: "data/trace/trace.db"
+
+thresholds:
+  # A span's font_size >= size_outlier_ratio * page_modal_font_size is flagged
+  # size_outlier=true (drop-cap / headline candidate). Per spec: computed per
+  # page, never globally.
+  size_outlier_ratio: 3.0
+
+  # Geometric glyph-drop canary (replaces a dictionary/ligature-insertion
+  # approach - see design/DESIGN.md "Ligature canary" section for why that
+  # approach was rejected). Within a single span (one line, one contiguous
+  # font/size/style run), the gap between two adjacent non-space characters
+  # is compared to this ratio * that character's font_size. Exceeding it
+  # means a glyph (e.g. a dropped f-ligature) likely failed to extract,
+  # leaving an unexplained hole.
+  #
+  # Calibrated on this PDF: measured intra-word gap/font_size ratios across
+  # all 18 pages (136,528 adjacent char pairs, tokenized with pdfplumber's
+  # own extract_words() - deliberately NOT this package's line/span
+  # grouping, since extract_words()'s internal layout heuristics correctly
+  # keep column-separated fragments as distinct words while this package's
+  # simpler row/gap grouping does not; see span_break_gap_ratio below) gave
+  # p50=-0.01, p99=0.19, p999=0.28, max=0.60 (the max came entirely from the
+  # page-11 stock-ticker row where a decorative leader-dot font abuts
+  # numerals). 0.75 sits with ~25% headroom above every observed legitimate
+  # gap in this corpus while staying well below the width of a fully
+  # dropped glyph.
+  kerning_gap_ratio: 0.75
+
+  # Chars sharing a y-band (row) can belong to different newspaper columns
+  # that happen to align vertically - this newspaper synchronizes baselines
+  # across columns to a shared leading grid, so it happens constantly, not
+  # just in rare wide-block cases (verified: page 1 body text merges
+  # "first"+"According" from two different columns into one span's text
+  # with no separator at all when this split is missing or set too high).
+  #
+  # A gap between consecutive same-style characters in the same row that
+  # exceeds span_break_gap_ratio * that char's font_size always starts a
+  # new span/line_id, even though font/style did not change and the y-band
+  # is the same.
+  #
+  # Calibrated on this PDF: real same-column inter-word gaps measured
+  # ~1.2-1.5pt (ratio ~0.17-0.2 at 9pt modal size, p999 0.28 measured over
+  # 136k char pairs). Real column-transition gaps on page 1 body text
+  # measured as low as 7.9pt (ratio 0.875) up to 50pt+. There is no
+  # magnitude that cleanly separates "large legitimate gap" from "dropped
+  # glyph" here - the two are genuinely confounded on this narrow-column
+  # layout. Given that under-splitting silently FUSES unrelated column text
+  # into one misleading span (a real correctness bug) while over-splitting
+  # only produces more numerous, still fully verbatim spans (harmless),
+  # 0.5 is set below the smallest observed real column-transition gap so
+  # every known transition reliably splits, accepting that this also
+  # splits some ticker/leader-dot runs finer than strictly necessary.
+  span_break_gap_ratio: 0.5
+
+  # Vertical tolerance for clustering characters into the same row-band,
+  # relative to the page's modal font size. Standard fraction-of-em banding.
+  row_band_tolerance_ratio: 0.3
+
+render:
+  # ~1MP image persisted per page in the bronze layer, for Phase 2's vision
+  # pass. Page is 992.1 x 1530.7 pt (portrait); a ~1.25MP target keeps the
+  # image close to typical vision-model input budgets without upscaling.
+  vision_target_megapixels: 1.25
+
+  # High-res render is NOT persisted for every page (18 pages x 300 DPI would
+  # be hundreds of MB, opened rarely). Generated on demand via the CLI for a
+  # specific page (debug/audit crops, and later Phase 2 region crops).
+  hires_dpi: 300
+
+canary:
+  # Font names with no per-page override use these substrings (case
+  # insensitive) to infer style from the embedded BaseFont name, since
+  # subsetted newspaper fonts rarely expose usable style flags any other way.
+  bold_markers: ["bold", "black", "heavy", "semibold"]
+  italic_markers: ["italic", "oblique"]
+
+gemini:
+  # Phase 2 boundary-finding call. Text-only in v1 (see design/DESIGN.md
+  # "No vision pass in v1" for why: ads on this PDF have almost no text -
+  # page 5 is 68 characters total - so they fall out naturally by having no
+  # lines to draw a boundary around, without needing a vision pass).
+  model: "gemini-3.1-flash-lite"
+
+  # History (see design/DESIGN.md "Gemini 3.x thinking tokens count against
+  # the output ceiling" and "Stream-order rebuild"): under the old
+  # unit-ID-list architecture, HIGH thinking repeatedly truncated
+  # (62,913-47,181 thought tokens against a 65,536 hard ceiling) because
+  # the model was doing large-scale ordering/bookkeeping over ~380 IDs.
+  # That whole task is gone now: the model finds a handful of line-number
+  # boundaries per article instead of selecting and ordering every unit.
+  # Step A latency experiment (page 1, bypassing cache, same prompt at each
+  # level): HIGH took 98.95s / 52,960 total tokens (47,183 of them
+  # thinking) and passed validation. MEDIUM took 9.72s / 7,147 total tokens
+  # (1,327 thinking) and found byte-identical line-range boundaries
+  # (Nepal body 57-196, inflation body 229-264, headline 197) with zero
+  # checksum/contiguity failures - a ~10x latency and ~7x token win for no
+  # measurable quality loss on this page. LOW took 8.81s / 7,732 tokens but
+  # FAILED validation: its end_words checksums were genuinely incomplete
+  # (e.g. "compared with 5.3%" instead of the real last words "5.3% in
+  # August last year") even though the line-range numbers it picked were
+  # still correct - a real self-verification quality regression, not the
+  # known drop-cap whitespace artifact _fuzzy_prefix/suffix_match tolerates
+  # (phase3.py). MEDIUM is the lowest level that still passes validation,
+  # so it's the default; HIGH remains available as a per-run override if a
+  # future page's boundaries look wrong at MEDIUM.
+  thinking_level: "MEDIUM"
+  temperature: 0.0
+
+  # Generous relative to the new ~300-token output size; kept well below
+  # Flash-Lite's 65,536 hard ceiling so a still-too-large response fails
+  # loudly with a diagnosable (thoughts, candidates, finish_reason) triple
+  # instead of truncating silently at the model's own limit.
+  max_output_tokens: 49152
+
+  # Bump this to invalidate ALL cached Gemini responses (it's part of the
+  # cache key alongside the line dump, model id, thinking_level, and
+  # max_output_tokens) without needing to change the model or re-run Phase 1.
+  prompt_version: "v4"
+
+concurrency:
+  # Real quotas: 500 requests/day, 15 requests/minute, 250,000 tokens/minute.
+  # At MEDIUM thinking (~9-10s/call, ~7,150 measured tokens/call on page 1),
+  # the 15 RPM cap binds before the 250K TPM cap does: one continuously-busy
+  # worker already produces ~6 requests/minute, so 250K/7,150 ~= 34 requests
+  # worth of TPM headroom is never the limiting factor at this speed - RPM
+  # is. tokens_per_minute is still enforced independently (a page with far
+  # more lines than page 1 could cost much more per call), so both windows
+  # are real ceilings, not just RPM in practice.
+  max_concurrent: 4
+
+  requests_per_minute: 15
+
+  requests_per_day: 500
+
+  tokens_per_minute: 250000
+
+  # Reserved against the tokens_per_minute window before a call's real
+  # usage is known (rate_limit.py corrects this to the actual total once
+  # the response returns). Set above the measured MEDIUM page-1 total
+  # (7,147) with margin for pages with more lines/articles than page 1.
+  estimated_tokens_per_request: 12000
