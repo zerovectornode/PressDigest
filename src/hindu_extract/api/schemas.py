@@ -139,3 +139,60 @@ class QuotaOut(BaseModel):
     requests_per_day_limit: int
     tokens_last_minute: int
     tokens_per_minute_limit: int
+
+
+# --- Summaries: edition-wide importance ranking -----------------------------
+
+ExclusionRiskValue = Literal["none", "possible_opinion", "possible_promotional"]
+
+
+class RankedArticleOut(BaseModel):
+    article_id: str
+    page: int
+    headline: str
+    rank: int
+    importance_score: int
+    category: str
+    why_it_matters: str
+    exclusion_risk: ExclusionRiskValue
+
+
+class DuplicateContinuationOut(BaseModel):
+    first_part_id: str
+    first_part_page: int
+    continues_on_page: int
+    conflicting_id: str
+
+
+ExclusionReasonCodeValue = Literal[
+    "PROMOTIONAL",
+    "OPINION_WITHOUT_ANALYSIS",
+    "ENTERTAINMENT",
+    "LOCAL_WITHOUT_BROADER_RELEVANCE",
+    "ROUTINE_STATEMENT",
+    "CONTINUATION_OF_EARLIER_ARTICLE",
+    "BELOW_THRESHOLD",
+    "OTHER",
+]
+
+
+class ExcludedArticleOut(BaseModel):
+    article_id: str
+    page: int
+    headline: str
+    reason_code: ExclusionReasonCodeValue
+    note: str
+
+
+class RankingOut(BaseModel):
+    generated_at: str
+    top_n: int
+    ranked: list[RankedArticleOut]
+    excluded: list[ExcludedArticleOut]
+    validation_ok: bool
+    validation_issues: list[str]
+    duplicate_continuations: list[DuplicateContinuationOut]
+    retried: bool
+    eligible_count_note: str | None
+    total_tokens: int
+    all_cached: bool

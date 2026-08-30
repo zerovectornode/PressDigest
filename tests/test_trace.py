@@ -106,6 +106,23 @@ def test_finish_run_aggregates_tokens_and_cache_hit_ratio_from_gemini_call_event
     assert run["cache_hit_ratio"] == pytest.approx(0.5)
 
 
+def test_finish_run_also_counts_ranking_stage_tokens(db_path):
+    # A ranking-only run (see ranking.py) has no 'gemini_call' events at
+    # all - only 'ranking', which is edition-wide rather than per-page.
+    # Excluding it from the run-level total would always report 0 tokens
+    # for a ranking run.
+    tracer = RunTracer(db_path=db_path, run_id=new_run_id())
+    tracer.start_run("delhi", "2025-09-13", None, 0)
+    with tracer.stage(0, "ranking") as detail:
+        detail["total_token_count"] = 23408
+        detail["cache_hit"] = False
+
+    tracer.finish_run("done")
+    run = get_run(db_path, tracer.run_id)
+    assert run["total_tokens"] == 23408
+    assert run["cache_hit_ratio"] == pytest.approx(0.0)
+
+
 def test_record_and_fetch_gemini_raw(db_path):
     tracer = RunTracer(db_path=db_path, run_id=new_run_id())
     tracer.start_run("delhi", "2025-09-13", None, 1)

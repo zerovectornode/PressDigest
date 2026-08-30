@@ -64,6 +64,11 @@ def test_list_editions_returns_well_formed_list():
     assert isinstance(r.json(), list)
 
 
+def test_ranking_returns_404_before_it_has_ever_been_computed():
+    r = client.get("/api/editions/nonexistent__2000-01-01/ranking")
+    assert r.status_code == 404
+
+
 @pytest.mark.skipif(
     os.environ.get("RUN_LIVE_TESTS") != "1",
     reason="set RUN_LIVE_TESTS=1 to run the live upload/job test (a full real Phase 2 run)",
@@ -169,3 +174,25 @@ def test_full_upload_job_completes_and_edition_is_listed():
     assert quota["requests_today"] > 0
     assert quota["requests_per_day_limit"] == 500
     assert quota["tokens_per_minute_limit"] == 250_000
+
+    # Summaries: edition-wide ranking, triggered against this same real edition.
+    r = client.get(f"/api/editions/{edition_id}/ranking")
+    assert r.status_code == 404  # not computed yet
+
+    r = client.post(f"/api/editions/{edition_id}/ranking")
+    assert r.status_code == 200
+    ranking = r.json()
+    assert 0 < len(ranking["ranked"]) <= 20
+    assert all(1 <= a["rank"] <= 20 for a in ranking["ranked"])
+    assert all(0 <= a["importance_score"] <= 100 for a in ranking["ranked"])
+    valid_categories = {
+        "POLITY_GOVERNANCE", "ECONOMY", "INTERNATIONAL", "ENVIRONMENT", "SCIENCE_TECH",
+        "SOCIAL_ISSUES", "JUDICIARY", "SECURITY_DEFENCE", "AGRICULTURE", "HEALTH",
+        "EDUCATION", "OTHER",
+    }
+    assert all(a["category"] in valid_categories for a in ranking["ranked"])
+    assert len({a["article_id"] for a in ranking["ranked"]}) == len(ranking["ranked"])  # no duplicate ids
+
+    r = client.get(f"/api/editions/{edition_id}/ranking")
+    assert r.status_code == 200
+    assert r.json()["ranked"] == ranking["ranked"]

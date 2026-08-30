@@ -161,3 +161,58 @@ export interface QuotaOut {
   tokens_per_minute_limit: number;
   [k: string]: unknown;
 }
+
+export interface RankedArticleOut {
+  article_id: string;
+  page: number;
+  headline: string;
+  rank: number;
+  importance_score: number;
+  category: string;
+  why_it_matters: string;
+  exclusion_risk: "none" | "possible_opinion" | "possible_promotional";
+  [k: string]: unknown;
+}
+
+export interface DuplicateContinuationOut {
+  first_part_id: string;
+  first_part_page: number;
+  continues_on_page: number;
+  conflicting_id: string;
+  [k: string]: unknown;
+}
+
+export interface ExcludedArticleOut {
+  article_id: string;
+  page: number;
+  headline: string;
+  reason_code:
+    | "PROMOTIONAL"
+    | "OPINION_WITHOUT_ANALYSIS"
+    | "ENTERTAINMENT"
+    | "LOCAL_WITHOUT_BROADER_RELEVANCE"
+    | "ROUTINE_STATEMENT"
+    | "CONTINUATION_OF_EARLIER_ARTICLE"
+    | "BELOW_THRESHOLD"
+    | "OTHER";
+  note: string;
+  [k: string]: unknown;
+}
+
+export interface RankingOut {
+  generated_at: string;
+  top_n: number;
+  ranked: RankedArticleOut[];
+  excluded: ExcludedArticleOut[];
+  validation_ok: boolean;
+  validation_issues: string[];
+  duplicate_continuations: DuplicateContinuationOut[];
+  retried: boolean;
+  eligible_count_note: string | null;
+  total_tokens: number;
+  all_cached: boolean;
+  [k: string]: unknown;
+}
+
+
+

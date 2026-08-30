@@ -131,7 +131,22 @@ function ValidationTab({ pages, stagesByPage }: { pages: number[]; stagesByPage:
         const checksums = (detail.checksum_mismatches as Array<Record<string, unknown>>) ?? []
         const contiguity = (detail.contiguity_issues as Array<Record<string, unknown>>) ?? []
         const overlaps = (detail.overlap_issues as Array<Record<string, unknown>>) ?? []
-        const failureCount = checksums.length + contiguity.length + overlaps.length
+        const headlineQuality = (detail.headline_quality_issues as Array<Record<string, unknown>>) ?? []
+        // Ranking runs (see ranking.py) record a single edition-wide
+        // validation event under the page_num=0 sentinel, with its own
+        // issues/duplicate_continuations/excluded shape rather than the
+        // per-page checksum/contiguity/overlap one.
+        const rankingIssues = (detail.issues as string[]) ?? []
+        const duplicateContinuations = (detail.duplicate_continuations as Array<Record<string, unknown>>) ?? []
+        const excluded = (detail.excluded as Array<Record<string, unknown>>) ?? []
+        // Ranking's validation detail uses issues/duplicate_continuations/
+        // excluded; the per-page pipeline's uses checksum_mismatches/
+        // contiguity_issues/overlap_issues/coverage_ratio - 'issues' only
+        // exists on the former, so it's a reliable discriminator.
+        const isRankingRun = 'issues' in detail
+        const failureCount = isRankingRun
+          ? rankingIssues.length + duplicateContinuations.length
+          : checksums.length + contiguity.length + overlaps.length + headlineQuality.length
         const isExpanded = expandedPage === pageNum
 
         return (
@@ -140,17 +155,20 @@ function ValidationTab({ pages, stagesByPage }: { pages: number[]; stagesByPage:
               onClick={() => setExpandedPage(isExpanded ? null : pageNum)}
               className="flex w-full items-center justify-between px-4 py-2.5 text-left text-sm"
             >
-              <span className="font-medium text-slate-700">page {pageNum}</span>
+              <span className="font-medium text-slate-700">{pageNum === 0 ? 'edition-wide (ranking)' : `page ${pageNum}`}</span>
               <span className="flex items-center gap-3 text-xs">
-                <span className="text-slate-400">
-                  coverage {detail.coverage_ratio !== undefined ? `${Math.round(Number(detail.coverage_ratio) * 100)}%` : '-'}
-                </span>
+                {!isRankingRun && (
+                  <span className="text-slate-400">
+                    coverage {detail.coverage_ratio !== undefined ? `${Math.round(Number(detail.coverage_ratio) * 100)}%` : '-'}
+                  </span>
+                )}
+                {isRankingRun && excluded.length > 0 && <span className="text-slate-400">{excluded.length} rejected candidate(s)</span>}
                 <span className={ok ? 'text-teal-600' : 'text-rose-600'}>
                   {ok ? 'OK' : `${failureCount} failure(s)`}
                 </span>
               </span>
             </button>
-            {isExpanded && failureCount > 0 && (
+            {isExpanded && (failureCount > 0 || excluded.length > 0) && (
               <div className="flex flex-col gap-2 border-t border-slate-100 px-4 py-3 text-xs text-slate-600">
                 {checksums.map((m, i) => (
                   <div key={`c${i}`} className="rounded bg-rose-50 p-2">
@@ -169,6 +187,33 @@ function ValidationTab({ pages, stagesByPage }: { pages: number[]; stagesByPage:
                     vs {JSON.stringify(o.range_b)}
                   </div>
                 ))}
+                {headlineQuality.map((h, i) => (
+                  <div key={`h${i}`} className="rounded bg-rose-50 p-2">
+                    <span className="font-medium">headline_quality article {String(h.article_id)}:</span> {String(h.detail)}
+                  </div>
+                ))}
+                {rankingIssues.map((issue, i) => (
+                  <div key={`r${i}`} className="rounded bg-rose-50 p-2">
+                    {issue}
+                  </div>
+                ))}
+                {duplicateContinuations.map((d, i) => (
+                  <div key={`d${i}`} className="rounded bg-rose-50 p-2">
+                    duplicate continuation: {String(d.first_part_id)} (p{String(d.first_part_page)}, continues on p
+                    {String(d.continues_on_page)}) vs {String(d.conflicting_id)}
+                  </div>
+                ))}
+                {excluded.length > 0 && (
+                  <div className="flex flex-col gap-1.5">
+                    <span className="font-medium text-slate-500">Rejected candidates:</span>
+                    {excluded.map((e, i) => (
+                      <div key={`e${i}`} className="rounded bg-amber-50 p-2">
+                        <span className="font-medium">[{String(e.reason_code)}] {String(e.article_id)}:</span>{' '}
+                        {String(e.note)}
+                      </div>
+                    ))}
+                  </div>
+                )}
               </div>
             )}
           </div>

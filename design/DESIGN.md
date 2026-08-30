@@ -787,3 +787,63 @@ the whole point of both - so either will reliably beat the actual headline
 in a naive size comparison. Font size is evidence toward a headline
 candidate, never proof by itself.
 
+## Ranking: thinking_level HIGH truncates here too (second confirmation)
+
+The edition-wide ranking call (see "Summaries: edition-wide importance
+ranking" below) was first run at `thinking_level=HIGH`,
+`max_output_tokens=49152`, matching the original spec. It truncated on the
+very first live attempt: 47,184 thinking tokens against the ceiling - a
+near-identical number to the Phase 2 HIGH truncation documented above
+(47,183), on a completely different task (ranking ~107 candidates vs.
+finding one page's boundaries). This is now the second time HIGH has
+consumed almost exactly the same huge thinking budget regardless of the
+actual task, which is strong evidence that Flash-Lite's HIGH setting
+scales thinking to fill whatever ceiling it's given rather than to the
+task's real complexity - not something specific to boundary-finding.
+Switched to MEDIUM (same reasoning already applied to Phase 2): a fresh,
+bypass-cache MEDIUM call ranked all 20 articles cleanly in 23,408 total
+tokens (1,293 of them thinking), zero truncation, zero retries needed
+once the validation logic itself was corrected (see below). Re-raising
+`max_output_tokens` for HIGH was deliberately not tried - per the Phase 2
+precedent, that just lets thinking grow further rather than converging.
+
+## Summaries: edition-wide importance ranking
+
+One Gemini call ranks every article in the edition together (not
+per-page - per-page scores aren't comparable, a weak page's best article
+would look artificially important with nothing to compete against).
+Input: headline, deck, `continues_on_page`, and a ~100-word body preview
+per article, each keyed by a composite id (`p{page}-{article_id}`, since
+gold JSON's per-page ids are reused independently across pages). Output:
+a fixed top-N list with rank, a 0-100 importance score, one of 12 fixed
+categories, a model-generated `why_it_matters` (at most 30 words), and an
+`exclusion_risk` flag - kept in its own field, structurally separate from
+any extracted article text, since it's the first prose in this product
+the model actually wrote rather than a fact about text already stored.
+
+**Duplicate continuations, detected by headline overlap, not page
+number.** A story split across pages (a first part with
+`continues_on_page` set, and its continuation registered as a separate
+article on that later page) risks being ranked twice. The initial
+cross-check flagged any ranked article merely sharing the continuation's
+target page - which produced false positives, because a continuation's
+target page routinely also contains other, completely unrelated
+top-ranked stories (verified live: page 8 has 10 articles; only 2 of them
+were the actual continuations of two page-1 stories, but the check
+flagged 2 different, unrelated page-8 articles instead, because it only
+checked page number). Newspapers commonly print a "jump head" on a
+continuation page - a repeated or near-identical headline rather than a
+blank one (verified live: page 8's actual jump head for the page-1 Nepal
+story is "Karki is Nepal's first woman **Prime Minister**", matching page
+1's "Karki is Nepal's first woman **PM**"). The fix checks headline word
+overlap (>=50% of the shorter headline's significant words, >=2 words
+shared) between a first-part's target page and anything ranked there,
+which correctly distinguishes "this is the same story's jump head" from
+"this just happens to be on the same page."
+
+**Retry-once is corrective, not blind**, because temperature=0 means a
+bare retry would very likely reproduce the identical output: on
+validation failure, the retry prompt is appended with the exact issues
+found (e.g. "you used category X, not in the enum" or the specific
+duplicate-continuation pairs), not just re-sent as-is.
+

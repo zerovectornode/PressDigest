@@ -7,6 +7,7 @@ import type {
   PageRawOut,
   ParsedMetadataOut,
   QuotaOut,
+  RankingOut,
   RunDetailOut,
   RunSummaryOut,
   StageEventOut,
@@ -77,4 +78,12 @@ export function getRunPageRaw(runId: string, pageNum: number): Promise<PageRawOu
 
 export function getQuota(): Promise<QuotaOut> {
   return request<QuotaOut>('/quota')
+}
+
+export function getRanking(editionId: string): Promise<RankingOut> {
+  return request<RankingOut>(`/editions/${editionId}/ranking`)
+}
+
+export function triggerRanking(editionId: string): Promise<RankingOut> {
+  return request<RankingOut>(`/editions/${editionId}/ranking`, { method: 'POST' })
 }

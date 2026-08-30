@@ -39,6 +39,10 @@ STAGE_NAMES = (
     "validation",
     "assembly",
     "render",
+    # Edition-wide, not per-page - recorded with page_num=0 as a sentinel
+    # for "the whole edition" rather than adding a nullable column, since
+    # every other stage genuinely is per-page. See ranking.py.
+    "ranking",
 )
 
 _SCHEMA = """
@@ -126,8 +130,12 @@ class RunTracer:
     def finish_run(self, status: str) -> None:
         conn = _get_connection(self.db_path)
         with _lock:
+            # Both stages represent a real Gemini call with a token cost and
+            # a cache-hit/miss outcome - a ranking-only run (see ranking.py)
+            # has no 'gemini_call' events at all, so excluding 'ranking'
+            # here would always report 0 tokens for it.
             rows = conn.execute(
-                "SELECT detail_json FROM stage_events WHERE run_id = ? AND stage = 'gemini_call'",
+                "SELECT detail_json FROM stage_events WHERE run_id = ? AND stage IN ('gemini_call', 'ranking')",
                 (self.run_id,),
             ).fetchall()
             total_tokens = 0

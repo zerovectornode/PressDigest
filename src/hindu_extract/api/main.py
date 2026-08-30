@@ -13,6 +13,7 @@ from fastapi import FastAPI, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
+from hindu_extract import ranking as ranking_lib
 from hindu_extract.api import editions as editions_lib
 from hindu_extract.api import jobs
 from hindu_extract.api import pages as pages_lib
@@ -29,6 +30,7 @@ from hindu_extract.api.schemas import (
     PagePhaseOut,
     PageRawOut,
     QuotaOut,
+    RankingOut,
     RunDetailOut,
     RunSummaryOut,
     StageEventOut,
@@ -36,6 +38,7 @@ from hindu_extract.api.schemas import (
 )
 from hindu_extract.config import load_config
 from hindu_extract.storage import raw_pdf_path
+from hindu_extract.trace import RunTracer, new_run_id
 
 app = FastAPI(title="hindu-extract API")
 
@@ -182,3 +185,44 @@ async def get_run_page_raw_route(run_id: str, page_num: int):
 @app.get("/api/quota", response_model=QuotaOut)
 async def get_quota_route():
     return runs_lib.get_quota(config)
+
+
+# --- Summaries: edition-wide importance ranking -----------------------------
+
+
+@app.get("/api/editions/{edition_id}/ranking", response_model=RankingOut)
+async def get_ranking_route(edition_id: str):
+    try:
+        edition, date = split_edition_id(edition_id)
+    except InvalidEditionId as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    result = ranking_lib.read_ranking(config, edition, date)
+    if result is None:
+        raise HTTPException(status_code=404, detail=f"no ranking computed yet for edition {edition_id!r}")
+    return result
+
+
+# Plain `def`, not `async def`: rank_edition makes a synchronous, possibly
+# slow (HIGH thinking, edition-wide) Gemini call - FastAPI runs a sync path
+# operation in a worker thread automatically, so this doesn't block the
+# event loop the way an async def calling blocking code would.
+@app.post("/api/editions/{edition_id}/ranking", response_model=RankingOut)
+def trigger_ranking_route(edition_id: str, no_cache: bool = False):
+    try:
+        edition, date = split_edition_id(edition_id)
+    except InvalidEditionId as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    detail = editions_lib.get_edition_detail(config, edition, date)
+    if detail is None:
+        raise HTTPException(status_code=404, detail=f"no edition {edition_id!r}")
+
+    tracer = RunTracer(db_path=config.trace_db, run_id=new_run_id())
+    tracer.start_run(edition, date, None, detail.page_count)
+    try:
+        ranking_lib.process_edition_ranking(config, edition, date, use_cache=not no_cache, tracer=tracer)
+        tracer.finish_run("done")
+    except Exception as e:  # noqa: BLE001 - report the failure, don't crash the request
+        tracer.finish_run("failed")
+        raise HTTPException(status_code=502, detail=f"ranking failed: {e}")
+
+    return ranking_lib.read_ranking(config, edition, date)

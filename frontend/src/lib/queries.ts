@@ -115,3 +115,20 @@ export function useRunPagesStages(runId: string | undefined, pages: number[]) {
     })),
   })
 }
+
+export function useRanking(editionId: string | undefined) {
+  return useQuery({
+    queryKey: ['ranking', editionId],
+    queryFn: () => api.getRanking(editionId!),
+    enabled: editionId !== undefined,
+    retry: false,
+  })
+}
+
+export function useTriggerRanking(editionId: string | undefined) {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: () => api.triggerRanking(editionId!),
+    onSuccess: (result) => queryClient.setQueryData(['ranking', editionId], result),
+  })
+}

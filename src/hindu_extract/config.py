@@ -35,6 +35,7 @@ class Paths:
     gemini_cache_root: Path
     raw_pdf_root: Path
     trace_db: Path
+    ranking_cache_root: Path
 
 
 @dataclass(frozen=True)
@@ -62,6 +63,17 @@ class ConcurrencyConfig:
 
 
 @dataclass(frozen=True)
+class RankingConfig:
+    model: str
+    thinking_level: str
+    temperature: float
+    max_output_tokens: int
+    prompt_version: str
+    body_preview_words: int
+    top_n: int
+
+
+@dataclass(frozen=True)
 class Config:
     pipeline_version: str
     paths: Paths
@@ -70,6 +82,7 @@ class Config:
     style: CanaryStyleConfig
     gemini: GeminiConfig
     concurrency: ConcurrencyConfig
+    ranking: RankingConfig
     project_root: Path
 
     @property
@@ -96,6 +109,10 @@ class Config:
     def trace_db(self) -> Path:
         return self.project_root / self.paths.trace_db
 
+    @property
+    def ranking_cache_root(self) -> Path:
+        return self.project_root / self.paths.ranking_cache_root
+
 
 def load_config(path: Path | None = None) -> Config:
     config_path = Path(path) if path else DEFAULT_CONFIG_PATH
@@ -114,6 +131,7 @@ def load_config(path: Path | None = None) -> Config:
             gemini_cache_root=Path(raw["paths"]["gemini_cache_root"]),
             raw_pdf_root=Path(raw["paths"]["raw_pdf_root"]),
             trace_db=Path(raw["paths"]["trace_db"]),
+            ranking_cache_root=Path(raw["paths"]["ranking_cache_root"]),
         ),
         thresholds=Thresholds(**raw["thresholds"]),
         render=RenderConfig(**raw["render"]),
@@ -123,4 +141,5 @@ def load_config(path: Path | None = None) -> Config:
         ),
         gemini=GeminiConfig(**raw["gemini"]),
         concurrency=ConcurrencyConfig(**raw["concurrency"]),
+        ranking=RankingConfig(**raw["ranking"]),
     )

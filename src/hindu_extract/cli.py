@@ -11,6 +11,7 @@ from hindu_extract.articles_pipeline import process_edition_articles, write_edit
 from hindu_extract.config import load_config
 from hindu_extract.pipeline import EmptyPageError, extract_pages
 from hindu_extract.lines import build_page
+from hindu_extract.ranking import process_edition_ranking
 from hindu_extract.render import render_debug_overlay, render_hires_image
 from hindu_extract.storage import bronze_edition_dir
 from hindu_extract.survey import build_survey, format_survey_table
@@ -189,6 +190,48 @@ def debug_overlay(pdf_path, page_num, out, config_path):
         image = render_debug_overlay(page, lines, config.render.hires_dpi)
         image.save(out)
     click.echo(f"wrote {out} ({len(lines)} lines overlaid)")
+
+
+@main.command()
+@click.option("--date", required=True)
+@click.option("--edition", required=True)
+@click.option("--no-cache", is_flag=True, help="Bypass the ranking response cache")
+@click.option("--config", "config_path", default=None, type=click.Path(path_type=Path))
+def rank(date, edition, no_cache, config_path):
+    """Edition-wide importance ranking: one call across every article
+    already extracted for this edition (run `articles` first)."""
+    config = load_config(config_path)
+    tracer = RunTracer(db_path=config.trace_db, run_id=new_run_id())
+    tracer.start_run(edition, date, None, 0)
+    try:
+        outcome = process_edition_ranking(config, edition, date, use_cache=not no_cache, tracer=tracer)
+        tracer.finish_run("done" if outcome.validation.ok else "failed")
+    except Exception as e:
+        tracer.finish_run("failed")
+        click.secho(f"FAILED: {e}", fg="red", err=True)
+        sys.exit(1)
+
+    cache_tag = "(cached)" if outcome.all_cached else ""
+    click.echo(f"ranked {len(outcome.ranked)} articles {cache_tag} - {outcome.total_tokens} tokens")
+    if outcome.retried:
+        click.secho("required one corrective retry", fg="yellow")
+    if outcome.eligible_count_note:
+        click.secho(outcome.eligible_count_note, fg="yellow")
+
+    for r in outcome.ranked:
+        click.echo(f"  {r.rank:2d}. [{r.category:18s}] score={r.importance_score:3d} p{r.page:02d}  {r.headline}")
+
+    if outcome.excluded:
+        click.echo(f"\n{len(outcome.excluded)} plausible candidate(s) rejected:")
+        for e in outcome.excluded:
+            click.echo(f"  - [{e.reason_code}] p{e.page:02d} {e.headline}: {e.note}")
+
+    if not outcome.validation.ok:
+        click.secho(f"\n{len(outcome.validation.issues)} validation issue(s):", fg="red")
+        for issue in outcome.validation.issues:
+            click.echo(f"  - {issue}")
+        for d in outcome.validation.duplicate_continuations:
+            click.echo(f"  - duplicate continuation: {d.first_part_id} vs {d.conflicting_id}")
 
 
 if __name__ == "__main__":

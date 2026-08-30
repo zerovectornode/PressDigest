@@ -37,6 +37,10 @@ MODELS = [
     schemas.RunDetailOut,
     schemas.PageRawOut,
     schemas.QuotaOut,
+    schemas.RankedArticleOut,
+    schemas.DuplicateContinuationOut,
+    schemas.ExcludedArticleOut,
+    schemas.RankingOut,
 ]
 
 
