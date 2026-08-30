@@ -1,3 +1,13 @@
+---
+title: PressDigest
+emoji: 📰
+colorFrom: indigo
+colorTo: blue
+sdk: docker
+app_port: 7860
+pinned: false
+---
+
 # PressDigest - newspaper e-paper extraction pipeline + reader
 
 PressDigest extracts individual articles - headline, deck, byline, dateline,
@@ -216,6 +226,39 @@ Includes a coordinate-mapping test that loads a real PDF (`docs/Newspaper.pdf`
 and an ordinary body-line bbox land in the correct vertical position, not
 mirrored - see design/DESIGN.md "Coordinate mapping" for why that's the
 specific thing worth testing.
+
+### Deploying (Hugging Face Spaces, Docker)
+
+The YAML frontmatter at the very top of this file is Hugging Face Spaces
+metadata (`sdk: docker`, `app_port: 7860`) - GitHub just renders it as a
+plain block, it has no effect there.
+
+The Space is deployed from this same repository via a second git remote,
+not a separate copy of the code - GitHub stays the single source of
+truth; redeploying is `git push space main`:
+
+```bash
+git remote add space https://huggingface.co/spaces/<user>/<space>
+git push space main
+```
+
+The `Dockerfile` at the repo root builds the frontend (`npm run build`)
+and the Python package into one image; FastAPI serves the built frontend
+and the `/api/*` routes from the same process on port 7860 (see
+`hindu_extract/api/main.py`'s SPA fallback route - StaticFiles alone
+doesn't 404-fallback client-side routes like `/pipeline` to
+`index.html`, so there's an explicit catch-all for that).
+
+Set `GEMINI_API_KEY` under the Space's Settings -> Secrets (never commit
+it, never bake it into the image - see `.env.example`).
+
+**Data is ephemeral by design on this deployment.** There's no external
+store configured; everything under `data/` (bronze/gold/cache/trace) lives
+on the container's own disk and is wiped on every rebuild or restart. A
+full 18-page edition costs one extraction run (well under the 500
+requests/day Gemini quota) and takes well under two minutes, so
+re-uploading after a restart is an accepted tradeoff, not a bug - the
+Dashboard's empty-editions state is what a fresh container shows.
 
 ## Configuration
 

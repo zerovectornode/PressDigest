@@ -6,12 +6,18 @@ as the CLI does.
 """
 from __future__ import annotations
 
+import logging
+import os
 import shutil
+import sys
+from contextlib import asynccontextmanager
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 
 from hindu_extract import ranking as ranking_lib
 from hindu_extract.api import editions as editions_lib
@@ -40,7 +46,45 @@ from hindu_extract.config import load_config
 from hindu_extract.storage import raw_pdf_path
 from hindu_extract.trace import RunTracer, new_run_id
 
-app = FastAPI(title="hindu-extract API")
+config = load_config()
+_FRONTEND_DIST = config.project_root / "frontend" / "dist"
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+_logger = logging.getLogger("hindu_extract.startup")
+
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    """Runs once per container boot. This deployment has no local Docker
+    verification (see design/DESIGN.md/README "Deploying") - iterating on
+    a misconfigured environment happens entirely against HF's build/runtime
+    logs, so a silent path/permission problem (data dir not writable, a
+    dependency missing its expected version) needs to be visible here
+    rather than surfacing later as an opaque 500 on first upload."""
+    data_dir = config.project_root / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    writable = os.access(data_dir, os.W_OK)
+
+    packages = ["pdfplumber", "pypdfium2", "Pillow", "fastapi", "uvicorn", "google-genai"]
+    versions = []
+    for pkg in packages:
+        try:
+            versions.append(f"{pkg}={version(pkg)}")
+        except PackageNotFoundError:
+            versions.append(f"{pkg}=MISSING")
+
+    _logger.info("python=%s", sys.version.split()[0])
+    _logger.info("project_root=%s", config.project_root)
+    _logger.info("data_dir=%s writable=%s", data_dir, writable)
+    _logger.info("frontend_dist=%s exists=%s", _FRONTEND_DIST, _FRONTEND_DIST.is_dir())
+    _logger.info("packages: %s", ", ".join(versions))
+    if not writable:
+        _logger.error("data_dir %s is NOT writable - uploads/extraction will fail", data_dir)
+
+    yield
+
+
+app = FastAPI(title="hindu-extract API", lifespan=_lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -49,7 +93,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-config = load_config()
+
+@app.get("/api/health")
+async def health_route():
+    """Liveness/readiness probe, and what the frontend polls with backoff
+    on first load to ride out a cold start (container just booted, or the
+    Space woke from idle) rather than showing a blank page or a hard
+    error - see AppReadyGate.tsx. has_editions being false is a normal,
+    expected state (a fresh container has nothing extracted yet), not a
+    failure."""
+    has_editions = bool(editions_lib.list_editions(config))
+    return {"status": "ok", "has_editions": has_editions}
 
 
 def _save_upload(file: UploadFile) -> Path:
@@ -226,3 +280,40 @@ def trigger_ranking_route(edition_id: str, no_cache: bool = False):
         raise HTTPException(status_code=502, detail=f"ranking failed: {e}")
 
     return ranking_lib.read_ranking(config, edition, date)
+
+
+# --- Serving the built frontend ---------------------------------------------
+#
+# Registered last, deliberately: every /api/* route above is a literal-
+# prefix match Starlette resolves before ever reaching this catch-all, so
+# there's no risk of this shadowing a real API route. Not present at all
+# when running the API alone in dev (frontend/dist doesn't exist until
+# `npm run build` has been run - see vite.config.ts's proxy for that case).
+#
+# StaticFiles(html=True) on its own does NOT do this: it only serves
+# index.html for a request that resolves to a *directory* (e.g. "/"), and
+# 404s on any other unmatched path - verified against Starlette's
+# StaticFiles.get_response. A client-side route like /pipeline or
+# /reader/<id>/<page> has no file on disk at all, so a direct navigation
+# or a page refresh on one of those would 404 without the explicit
+# fallback-to-index.html below. Verified against a real, locally-running
+# instance of this app (no Docker available in this environment - see
+# README "Deploying"): direct GET of /pipeline and /reader/<id>/<page>
+# both return the SPA shell (200), and /assets/* and /favicon.svg serve
+# correctly. _FRONTEND_DIST is set above, alongside `config`.
+if _FRONTEND_DIST.is_dir():
+    app.mount("/assets", StaticFiles(directory=_FRONTEND_DIST / "assets"), name="frontend-assets")
+
+    @app.get("/{full_path:path}")
+    async def spa_route(full_path: str):
+        # An unmatched /api/* path is a real 404 (a bad endpoint, not a
+        # client-side route) - falling through to index.html here would
+        # silently mask it as a 200 HTML response instead. Verified live:
+        # this exact gap let GET /api/nonexistent return 200 before this
+        # check was added.
+        if full_path.startswith("api/"):
+            raise HTTPException(status_code=404, detail=f"no such route: /{full_path}")
+        candidate = _FRONTEND_DIST / full_path
+        if full_path and candidate.is_file():
+            return FileResponse(candidate)
+        return FileResponse(_FRONTEND_DIST / "index.html")

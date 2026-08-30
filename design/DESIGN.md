@@ -1077,3 +1077,94 @@ on its own - the story's own correct kicker ("PICTURE THIS") was also
 misclassified into the headline. Making `section_kicker` a list would
 need to be paired with a column-consistency check that also stops "GAME
 THEORY" from being considered a candidate for this story at all.
+
+## Deployment: Hugging Face Spaces (Docker)
+
+Single container: a multi-stage `Dockerfile` builds the React frontend
+(`npm run build`) in one stage and installs the Python package in
+another, with FastAPI serving both the built frontend and `/api/*` from
+one process on port 7860 (HF Docker Spaces hardcode this port).
+
+**No system packages are needed for PDF rendering.** Verified directly
+against the installed `pdfplumber==0.11.10`: `page.to_image()`
+(`pdfplumber/display.py`) imports `pypdfium2` and calls
+`pypdfium2.PdfDocument` directly - no subprocess call to poppler,
+ImageMagick, or ghostscript anywhere in this codebase or its rendering
+dependency. `pypdfium2`'s wheel bundles a prebuilt PDFium binary. The
+Dockerfile still installs `build-essential`/`libjpeg62-turbo`/`zlib1g` as
+insurance (see below), not because anything here needs them.
+
+**Editable install, deliberately**, not a regular `pip install .`:
+`config.py`'s `DEFAULT_CONFIG_PATH` is computed from `Path(__file__)`,
+three parents up - in local dev that resolves to the repo root; a
+non-editable install would copy the package into site-packages instead,
+breaking that resolution against the real `config/default.yaml`. The
+Dockerfile's `WORKDIR /app` plus `pip install -e ".[api]"` keeps
+`__file__` anchored at `/app`, the same shape as local dev.
+
+**StaticFiles(html=True) does not do SPA fallback** - verified by reading
+Starlette's `StaticFiles.get_response` source directly rather than
+assuming: it only serves `index.html` for a request that resolves to a
+*directory* (`/`), and returns a plain 404 for any other unmatched path.
+A client-side route like `/pipeline` or `/reader/<id>/<page>` has no file
+on disk at all, so direct navigation or a page refresh on one would 404
+without an explicit fallback. `main.py` registers a catch-all
+`/{full_path:path}` route *after* every `/api/*` route (Starlette matches
+literal prefixes before catch-alls, so this can't shadow a real API
+route) that serves the matching static file if one exists, or
+`index.html` otherwise for the SPA to take over client-side routing.
+
+**A real bug this same catch-all introduced, found by actually running
+the app rather than reasoning about the routing table**: without a
+guard, `GET /api/nonexistent` fell through to the catch-all and returned
+200 with `index.html`'s content instead of a 404 - any unmatched `/api/*`
+path was silently masked as a successful HTML response, which would hide
+real API misuse/typos rather than surfacing them. Fixed by checking
+`full_path.startswith("api/")` and raising 404 explicitly before ever
+consulting the filesystem. Caught during a local (non-containerized)
+smoke test - no local Docker is available in this environment, so
+verification for everything else in this section happens against HF's
+own build/runtime logs and the live Space URL instead of `docker build`/
+`docker run` locally; this specific class of bug is exactly why the app
+was run for real rather than only read.
+
+**Startup sanity logging** (`main.py`'s `startup` event): logs Python
+version, the resolved `project_root`/data directory and whether it's
+writable, whether `frontend/dist` exists, and installed versions of the
+packages most likely to differ between the dev machine and HF's build
+(`pdfplumber`, `pypdfium2`, `Pillow`, `fastapi`, `uvicorn`,
+`google-genai`). Exists specifically because there's no local container to
+inspect when something's wrong - a silent path/permission problem needs
+to be visible in the first few log lines HF shows after boot, not
+discovered later as an opaque 500 on first upload.
+
+**Persistence: re-extract on demand, no external store.** `data/`
+(bronze/gold/cache/trace/uploads) lives on the container's own ephemeral
+disk - wiped on every rebuild/restart. Already handled gracefully by
+existing code with no changes needed: `editions.py`'s
+`_iter_edition_date_dirs` returns nothing if `gold_root` doesn't exist at
+all, so `list_editions` returns `[]` and the Dashboard shows its normal
+empty-upload state on a fresh container rather than erroring. A full
+18-page edition is well under the 500 requests/day Gemini quota and well
+under two minutes, so re-uploading after a restart is an accepted
+tradeoff, not a gap to fix.
+
+**Cold-start gate** (`frontend/src/components/AppReadyGate.tsx`): polls
+`/api/health` with exponential backoff (500ms up to 8s between attempts)
+before rendering the real app, so the very first request of a session -
+which can fail at the network level outright (connection refused/reset)
+rather than as a clean HTTP error if the container is still booting from
+idle - shows a loading state instead of a blank page. Deliberately
+separate from `queries.ts`'s per-query `retry` settings: several of those
+are `retry: false` on purpose (e.g. a 404 for "no ranking computed yet"
+is a meaningful state, not a transient failure to retry through), so the
+cold-start retry logic doesn't touch that.
+
+**Remote strategy: a second git remote on this same repository**, not a
+separate deploy repo - `git push space main` redeploys exactly what's on
+GitHub, with no second place for the code to drift from. The tradeoff is
+cosmetic: HF Spaces requires the Docker/port configuration as YAML
+frontmatter at the top of `README.md` specifically (no alternate
+filename), so that block now appears at the top of the GitHub-facing
+README too - GitHub renders it as an inert text block, not a functional
+problem, just a few extra lines above the real content.
