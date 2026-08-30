@@ -970,3 +970,110 @@ structural problem the ligature canary's dictionary approach was rejected
 for (see "Ligature canary" above) - a human can skim a flagged list, but a
 build should not fail on it. The geometric check (`lines.py`) is the actual
 fix; the ligature canary (`canary.py`) remains the only hard-fail check.
+
+## Standing rule: stream adjacency does not imply same-story membership
+
+Stream adjacency does not imply same-story membership, and single-range
+fields cannot represent non-contiguous furniture. deck and caption are
+lists for this reason; byline and section_kicker are not, which is why
+photo-caption name labels (p11, p12) and a neighbouring column's standing
+kicker (p14) were absorbed. Any field that can have geometrically
+separated or cross-column neighbours needs either a list type or an
+explicit column-consistency check.
+
+This is the fourth instance of the same underlying mistake as the
+"Standing rule: font size alone never identifies a headline" section
+above and "Column fusion" earlier: two geometrically-unrelated pieces of
+page furniture happen to sit close together in the PDF's raw content
+stream, and the current schema has no way to keep the real content while
+skipping the wrong neighbour.
+
+Both bugs below were found via the per-page quality report (a manual
+review aid built from existing gold JSON, no API calls) and diagnosed
+against bronze line geometry (x0/top bbox). Both are recorded here as
+**known limitations, not yet fixed** - fixing either means changing the
+Phase 2 prompt, which bumps `gemini.prompt_version` and invalidates the
+entire Gemini response cache (18 live calls to regenerate). Deferred
+until after the current deployment.
+
+### Bug 1: byline field absorbing adjacent photo-caption name labels (pages 11, 12)
+
+Four confirmed cases. In every one, the genuine byline+dateline pair sits
+at one x0 (consecutive y, same column), and an extra name absorbed into
+the same byline range sits at a *different* x0 - consistent with a
+caption/name-tag under an inset photo elsewhere in the layout, not
+printed byline text:
+
+- **p11 article '6'** (SEBI): byline+dateline "Lalatendu Mishra" /
+  "MUMBAI" at x0=621.9. Absorbed: "Tuhin Kanta Pandey" at x0=740.6,
+  top=352.1 - a different column, evidently a caption near a photo of the
+  SEBI chairman elsewhere on the page.
+- **p11 article '7'** (EU trade commissioner): byline+dateline "The Hindu
+  Bureau" / "NEW DELHI" at x0=28.3. Absorbed: "Maroš Šefčovič" at
+  x0=147.1, top=1009.6 - a different column, consistent with a name-tag
+  under an inset photo of him.
+- **p11 article '9'** (Kerala blue economy conclave): byline+dateline
+  "The Hindu Bureau" / "THIRUVANANTHAPURAM" at x0=28.3. Absorbed: "Saji
+  Cherian" at x0=147.1, top=1386.3 - directly above a body sub-column at
+  that same x0, consistent with a caption under an inset photo of the
+  Minister quoted in the body.
+- **p12 article '8'** (Charlie Kirk suspect): byline+dateline "Agence
+  France-Presse" / "OREM" at x0=740.6. Absorbed: "Tyler Robinson" at
+  x0=859.3, top=580.8 - a narrower right-hand sub-column, consistent with
+  a mugshot caption. This one rules out a printing-convention
+  explanation outright: Tyler Robinson is the suspect, not a journalist.
+
+Root cause: `byline` is a single contiguous `LineRange`
+(`gemini_prompt.py`'s `RESPONSE_JSON_SCHEMA`). When a caption-shaped line
+sits stream-adjacent to the genuine byline line, the model can't include
+the real byline without also sweeping in the line between them - exactly
+what `deck`/`caption` being lists of ranges was already designed to
+avoid, just not applied to `byline`/`section_kicker`.
+
+Confirmed **not** a missed cross-article overlap: none of the four
+absorbed lines are claimed by any other article's fields, and none are in
+`excluded_line_nos` - this is a single-field boundary error, not a
+coverage conflict the existing overlap check would ever catch (that check
+is body-only).
+
+Edition-wide sweep (byline with 4+ words, multiple capitalized-name runs,
+or an embedded all-caps token): 12 hits total. Beyond the 4 cases above,
+every other hit is legitimate printed text already verified against
+bronze lines - agency names ("Press Trust of India" x4), two op-ed
+byline-bio lines on page 6 ("Shailesh Gandhi is a former Central
+Information Commissioner", etc.), and a genuine two-line signature block
+on page 17 ("NIRMALA LAKSHMAN" / "Chairperson, The Hindu Group", same x0
+column, contiguous). No further hidden cases of this shape.
+
+Proposed fix (not implemented): tighten the Phase 2 system prompt so a
+photo-credit/name label adjacent to a byline is recognized as caption
+material, not byline, plus a phase3 backstop flagging any byline with 4+
+words or an embedded all-caps token for review.
+
+### Bug 2: page 14, unrelated column's kicker absorbed into a story's furniture
+
+Article 2 (a trampoline-gymnastics photo feature) assembled
+`headline="PICTURE THIS Spring, roll"` and `section_kicker="GAME THEORY"`.
+Bronze geometry:
+
+- L282 "PICTURE THIS" (x0=453.6, top=1042.8, right column) - this
+  article's real kicker, directly below a right-column divider rule
+  (L281, x0=454.9).
+- L283 "Spring, roll" (x0=453.6, top=1408.1, same column, ~365pt lower) -
+  this article's real headline, positioned below where the feature's
+  photo sits.
+- L285 "GAME THEORY" (x0=28.3, top=1042.8, left column) - an unrelated
+  feature's standing kicker, at the same y-height as "PICTURE THIS" but a
+  different column, directly below a *left*-column divider rule (L284,
+  x0=29.7). No other content anywhere nearby in the bronze data is
+  associated with it.
+
+The model fused "PICTURE THIS"+"Spring, roll" into one headline range and
+picked the geometrically-unrelated "GAME THEORY" as `section_kicker`,
+purely because L282/L285 are three lines apart in stream order despite
+sitting in different columns. This is **not** a case of one story
+genuinely carrying two stacked kickers that a list-type field would solve
+on its own - the story's own correct kicker ("PICTURE THIS") was also
+misclassified into the headline. Making `section_kicker` a list would
+need to be paired with a column-consistency check that also stops "GAME
+THEORY" from being considered a candidate for this story at all.
