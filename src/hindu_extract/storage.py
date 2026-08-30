@@ -1,5 +1,5 @@
-"""Bronze layer: per-page JSON + rendered vision image, keyed on
-edition/date/page. This is the durable, human-browsable output of Phase 1.
+"""Bronze layer: per-page JSON, keyed on edition/date/page. This is the
+durable, human-browsable output of Phase 1.
 """
 from __future__ import annotations
 

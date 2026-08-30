@@ -38,7 +38,6 @@ STAGE_NAMES = (
     "gemini_call",
     "validation",
     "assembly",
-    "render",
     # Edition-wide, not per-page - recorded with page_num=0 as a sentinel
     # for "the whole edition" rather than adding a nullable column, since
     # every other stage genuinely is per-page. See ranking.py.

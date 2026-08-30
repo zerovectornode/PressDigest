@@ -136,9 +136,9 @@ def test_record_and_fetch_gemini_raw(db_path):
 def test_get_run_pages_returns_distinct_page_numbers_in_order(db_path):
     tracer = RunTracer(db_path=db_path, run_id=new_run_id())
     tracer.start_run("delhi", "2025-09-13", None, 2)
-    with tracer.stage(2, "render"):
+    with tracer.stage(2, "line_building"):
         pass
-    with tracer.stage(1, "render"):
+    with tracer.stage(1, "ligature_canary"):
         pass
     with tracer.stage(1, "char_extraction"):
         pass

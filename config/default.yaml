@@ -106,11 +106,6 @@ thresholds:
   word_space_gap_ratio: 0.12
 
 render:
-  # ~1MP image persisted per page in the bronze layer, for Phase 2's vision
-  # pass. Page is 992.1 x 1530.7 pt (portrait); a ~1.25MP target keeps the
-  # image close to typical vision-model input budgets without upscaling.
-  vision_target_megapixels: 1.25
-
   # High-res render is NOT persisted for every page (18 pages x 300 DPI would
   # be hundreds of MB, opened rarely). Generated on demand via the CLI for a
   # specific page (debug/audit crops, and later Phase 2 region crops).

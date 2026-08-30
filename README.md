@@ -145,7 +145,6 @@ the pipeline keeps going rather than crashing (see design/DESIGN.md
 
 ```
 data/bronze/{edition}/{date}/page_{NN}/page.json   lines + page metadata
-data/bronze/{edition}/{date}/page_{NN}/vision.png  ~1.25MP render for Phase 2
 data/bronze/{edition}/{date}/manifest.json         edition-level summary
 data/cache/{pdf_hash}/{version_hash}/page_{NN}/    cache keyed on PDF content
                                                      + pipeline_version, so

@@ -126,6 +126,27 @@ region is an ad (e.g. reading a logo), but isn't needed to correctly
 exclude it. Revisit if a future edition has ads with substantial embedded
 text that could be mistaken for article content.
 
+### Removed: the unused vision-image render
+
+The ~1.25MP `vision.png` this section anticipated needing was built
+speculatively before Phase 2 turned out to be text-only, and nothing ever
+read it back: verified by tracing every consumer - `gemini_client.py`
+sends `build_user_prompt`'s plain text, never an image; no `api/` route
+serves or references it; the frontend renders pages via PDF.js against
+the raw uploaded PDF (`/api/editions/{id}/pdf`), never a bronze-layer
+image. It was pure write-side cost: one full-page pdfplumber rasterization
+per page (the heaviest CPU step in Phase 1) plus ~900KB/page, written
+twice (once to the content-hash cache, once copied into bronze) - roughly
+32MB and one wasted render per 18-page edition, indefinitely. Removed
+entirely (`render.py`, `cache.py`, `pipeline.py`, `RenderConfig`) rather
+than gated behind a flag, since there's no vision-pass roadmap item this
+was serving. `render.py`'s on-demand high-res render and debug overlay
+(genuinely used, by the CLI's `render-hires`/`debug-overlay` commands) are
+untouched. Found while preparing the GCP e2-micro deployment - see
+"Deployment: GCP e2-micro VM" below - where a shared-core CPU and a 30GB
+disk make an unused per-page rasterization step worth removing rather
+than shrugging off.
+
 ## Phase 2 JSON contract
 
 Request: one call per page. System instructions (`gemini_prompt.SYSTEM_PROMPT`)

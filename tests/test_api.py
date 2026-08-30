@@ -160,7 +160,7 @@ def test_full_upload_job_completes_and_edition_is_listed():
     assert r.status_code == 200
     stage_events = r.json()
     stage_names = {e["stage"] for e in stage_events}
-    assert {"char_extraction", "line_building", "ligature_canary", "gemini_call", "validation", "assembly", "render"} <= stage_names
+    assert {"char_extraction", "line_building", "ligature_canary", "gemini_call", "validation", "assembly"} <= stage_names
 
     r = client.get(f"/api/runs/{run_id}/pages/{page_with_articles}/raw")
     assert r.status_code == 200

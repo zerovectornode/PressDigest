@@ -55,7 +55,7 @@ def main():
 @click.option("--config", "config_path", default=None, type=click.Path(path_type=Path))
 @click.option("--force", is_flag=True, help="Ignore cache and re-extract")
 def extract(pdf_path, date, edition, pages, config_path, force):
-    """Extract every page's lines + metadata + vision image into the bronze layer."""
+    """Extract every page's lines + metadata into the bronze layer."""
     config = load_config(config_path)
     page_nums = _parse_pages(pages, pdf_path)
 

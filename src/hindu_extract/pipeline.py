@@ -1,7 +1,7 @@
 """Orchestrates Phase 1 extraction for one or more pages: cache lookup,
-stream-order line-building, geometric canary, vision-image rendering, and
-writing into the bronze layer. Every decision point in here is either a
-cache hit/miss or an I/O step - no content interpretation.
+stream-order line-building, geometric canary, and writing into the bronze
+layer. Every decision point in here is either a cache hit/miss or an I/O
+step - no content interpretation.
 """
 from __future__ import annotations
 
@@ -16,7 +16,6 @@ from hindu_extract.canary import check_page
 from hindu_extract.config import Config
 from hindu_extract.lines import build_page
 from hindu_extract.models import CanaryFinding, FontInfo, PageMetadata
-from hindu_extract.render import render_vision_image
 from hindu_extract.trace import RunTracer
 
 
@@ -43,14 +42,14 @@ def _process_one_page(
     config: Config,
     force: bool,
     tracer: RunTracer | None = None,
-) -> tuple[dict, "PIL.Image.Image | None", bool]:
+) -> tuple[dict, bool]:
     cache_dir = cache.cache_dir_for(config, pdf_hash, version_hash, page_num)
     if not force and cache.is_cache_complete(cache_dir):
         if tracer is not None:
-            for stage_name in ("char_extraction", "line_building", "ligature_canary", "render"):
+            for stage_name in ("char_extraction", "line_building", "ligature_canary"):
                 with tracer.stage(page_num, stage_name) as detail:
                     detail["cache_hit"] = True
-        return cache.read_cache(cache_dir), None, True
+        return cache.read_cache(cache_dir), True
 
     page = pdf.pages[page_num - 1]
 
@@ -58,7 +57,6 @@ def _process_one_page(
         chars = list(page.chars)
         metadata, lines, word_space_log = build_page(page, page_num, config)
         findings = check_page(page, page_num, metadata.modal_font_size, config)
-        vision_image = render_vision_image(page, config.render.vision_target_megapixels)
     else:
         with tracer.stage(page_num, "char_extraction") as detail:
             chars = list(page.chars)
@@ -77,9 +75,6 @@ def _process_one_page(
             findings = check_page(page, page_num, metadata.modal_font_size, config)
             detail["finding_count"] = len(findings)
             detail["findings"] = [f.to_dict() for f in findings]
-        with tracer.stage(page_num, "render") as detail:
-            vision_image = render_vision_image(page, config.render.vision_target_megapixels)
-            detail["target_megapixels"] = config.render.vision_target_megapixels
 
     page_result_dict = {
         "metadata": metadata.to_dict(),
@@ -87,8 +82,8 @@ def _process_one_page(
         "canary_findings": [f.to_dict() for f in findings],
         "word_space_log": [w.to_dict() for w in word_space_log],
     }
-    cache.write_cache(cache_dir, page_result_dict, vision_image)
-    return page_result_dict, vision_image, False
+    cache.write_cache(cache_dir, page_result_dict)
+    return page_result_dict, False
 
 
 def extract_pages(
@@ -106,8 +101,8 @@ def extract_pages(
     reproduces prior behavior exactly) so a caller like the API's
     background job runner can report incremental progress without this
     function needing to know anything about jobs. tracer, if given, records
-    a char_extraction/line_building/ligature_canary/render stage event per
-    page - see trace.py."""
+    a char_extraction/line_building/ligature_canary stage event per page -
+    see trace.py."""
     pdf_bytes = Path(pdf_path).read_bytes()
     pdf_hash = cache.hash_bytes(pdf_bytes)
     version_hash = cache.hash_text(config.pipeline_version)
@@ -115,7 +110,7 @@ def extract_pages(
     outcomes: list[PageOutcome] = []
     with pdfplumber.open(pdf_path) as pdf:
         for page_num in page_nums:
-            page_dict, _vision_image, from_cache = _process_one_page(
+            page_dict, from_cache = _process_one_page(
                 pdf, pdf_hash, version_hash, page_num, config, force, tracer=tracer
             )
             cache_dir = cache.cache_dir_for(config, pdf_hash, version_hash, page_num)
