@@ -1,0 +1,714 @@
+# Design: The Hindu e-paper extraction pipeline
+
+## Phase decomposition
+
+**Phase 1 (this package) - verbatim span extraction.** Every text span in the
+PDF is extracted with its geometry and font metadata, exactly as it appears
+in the character stream. No reordering, no joining across lines, no
+filtering, no interpretation. Anything ambiguous (an oversized glyph, a
+suspicious gap, a font with no ToUnicode CMap) is recorded as metadata for
+Phase 2 to decide, never resolved here. This is a deliberate constraint, not
+an oversight: Phase 1's output is only trustworthy as ground truth if it
+never makes a judgment call that could be wrong.
+
+**Phase 2 (built) - LLM-based article assembly.** Gemini 3.1 Flash-Lite
+reads a page's units (see "Line-granularity units" below - not raw spans)
+and returns JSON that groups unit IDs into articles and orders them within
+each article. Implemented in `units.py` (unit construction), `gemini_prompt.py`
+(prompt + response schema), `gemini_client.py` (API call + cache), and
+`grouping.py` (orchestrates the call + retry).
+
+**Phase 3 (minimal, built) - partition verification.** Every unit ID must
+appear exactly once across all articles and excluded_units - missing,
+duplicated, and hallucinated IDs are all detected (`phase3.py`). One retry
+citing the specific failure; if that also fails, a deterministic repair
+runs (drop duplicates/hallucinations, file anything still missing into
+excluded_units) and the page is marked `needs_review` rather than crashing
+the run. Deferred to later, not built: LLM seam-continuity checking,
+self-consistency runs across repeated calls, model escalation. See
+"Metrics" below for what's measurable now versus still open.
+
+### Why "the LLM emits IDs only" guarantees verbatim output
+
+Phase 2's prompt gives the LLM a page's units (unit_id + text + geometry, see
+below) and asks it to return unit IDs grouped into articles - IDs only,
+never text (enforced by `RESPONSE_JSON_SCHEMA` in `gemini_prompt.py`: every
+content-bearing field is either an array of ID strings or a closed enum;
+none accepts free text). The final article text is assembled entirely by
+`assemble.py` concatenating the original Phase 1 text in the order the LLM
+specified, not the text the LLM wrote in its response. This means:
+
+- The LLM cannot introduce a typo, paraphrase, or hallucinate a word -
+  whatever ends up in an article's text is byte-for-byte Phase 1 text that
+  was extracted from the PDF's real character stream.
+- Verbatim fidelity is a structural property of the pipeline, not a
+  probabilistic property of the model. A single wrong or invented character
+  in the LLM's *reasoning* has no path into the output text; the worst it
+  can do is mis-order or mis-group real units, which Phase 3's partition
+  check is built to catch.
+- It also makes the "no text content" validation nearly free: because real
+  unit IDs have a fixed shape (`pNNN-Lnnnn` or `pNNN-sNNNNN`), any prose the
+  model accidentally (or adversarially) returned instead of an ID cannot
+  coincidentally match a known ID - it simply falls out of the partition
+  check as a "hallucinated" ID. There is no separate text-sniffing pass;
+  `phase3.check_partition`'s hallucination detection *is* the "assert no
+  returned object contains text content" check.
+
+This is the reason Phase 1 must never merge or drop spans on its own
+judgment: every span (or, for Phase 2's purposes, every unit) the LLM might
+need to reference must exist, intact and individually addressable, before
+Phase 2 ever runs.
+
+## Line-granularity units (Phase 2's unit of work)
+
+Phase 2 does not send individual spans to the model - it sends **units**,
+built by `units.py`:
+
+- A **line unit** is every span sharing a `line_id`, concatenated in
+  `order_in_line` order, *except* any span flagged `size_outlier` or
+  `single_glyph`.
+- A **standalone unit** is exactly one such flagged span, always emitted on
+  its own - never merged into a line, even when other spans share its
+  `line_id`.
+
+Two reasons this is span-level's job, not Phase 2's:
+
+1. **Token/ID-space inflation.** Page 1 has 385 spans but only 382 units
+   (most lines are already a single style-run span, so line-grouping barely
+   shrinks the ID space on this page - but pages with more inline style
+   changes, hyphenation, or fragmented columns benefit more, and every
+   avoided unit is one fewer ID the model has to track without dropping or
+   duplicating across the entire page). Sending raw spans as the atomic
+   unit multiplies the ID-tracking surface for no benefit: nothing about
+   article-grouping judgment happens at sub-line granularity.
+2. **Drop-cap corruption risk.** A drop-cap's bounding box is tall enough to
+   vertically overlap two or three ordinary body-text lines beside it (page
+   1: the "N" glyph spans the height of "epal President Ram" / "Chandra
+   Poudel ap-" / "pointed"). If a drop-cap were folded into whichever line
+   its y-centre happens to land on, that would silently re-fuse it with
+   unrelated line text - reintroducing exactly the "meetNings"-shaped
+   corruption Phase 1's `span_break_gap_ratio` fix eliminated, just one
+   layer up the pipeline. Emitting it standalone and letting `assemble.py`
+   fuse it with zero separator onto whatever unit the *model* places next
+   to it (see below) keeps that decision explicit and auditable instead of
+   implicit in a geometry heuristic.
+
+The same standalone mechanism also cleanly isolates headline/deck-scale
+text (`size_outlier` without `single_glyph`) as its own unit, which turns
+out to help rather than hurt: it means headline text never arrives at the
+model pre-mixed with body text on the same unit, matching the schema's need
+for a distinct `headline_units`/`deck_units` classification.
+
+### Drop-cap assembly: standalone-unit fusion
+
+`assemble.py` tracks whether the *previous* unit appended to a field was a
+`single_glyph` standalone unit. If so, the *next* unit is concatenated with
+**zero separator** - no space, no de-hyphenation logic - because a drop-cap
+is literally the first character of the following word (`"N"` + `"epal
+President Ram"` -> `"Nepal President Ram"`). This is a structural fact
+about the glyph, not a cleanup decision, so it applies identically in both
+the raw and de-hyphenated text variants. Every other field-internal join
+defaults to a single space, with line-final-hyphen de-hyphenation applied
+only in the cleaned variant (see "Assembly" below).
+
+### No vision pass in v1
+
+Phase 2 is text-only for now. The units already carry font_size, font_name,
+and bbox, which cover the geometric signal a vision pass would otherwise
+need to approximate from pixels, at a fraction of the token cost. Ads on
+this PDF carry almost no extractable text (page 5: 68 characters across the
+entire page - the rest is 70 embedded images), so they fall out of the
+grouping naturally: an ad's units simply don't form coherent
+headline/body/byline structure the way a real article's units do, and the
+prompt instructs the model to route anything that doesn't look like article
+prose into `excluded_units`. A vision pass would help confirm *why* a
+region is an ad (e.g. reading a logo), but isn't needed to correctly
+exclude it. Revisit if a future edition has ads with substantial embedded
+text that could be mistaken for article content.
+
+## Phase 2 JSON contract
+
+Request: one call per page. System instructions (`gemini_prompt.SYSTEM_PROMPT`)
+plus a compact per-line unit listing (`gemini_prompt.build_user_prompt`):
+
+```
+<unit_id>|<x0>,<y0>,<x1>,<y1>|<font_size>|<font_name>[STANDALONE]|<text>
+```
+
+Coordinates are rounded to integers to save tokens; a header line states the
+page's modal body font size as a baseline the model can compare font sizes
+against.
+
+Response (`gemini_prompt.RESPONSE_JSON_SCHEMA`, enforced via Gemini
+structured output - `response_mime_type=application/json` +
+`response_json_schema`):
+
+```
+articles: [{
+  article_id: str,
+  headline_units, deck_units, byline_units, dateline_units,
+  caption_units: [unit_id],
+  body_units: [unit_id in reading order],
+  continues_on_page: int | null,
+  is_truncated: bool,
+  confidence: "high" | "medium" | "low",
+}]
+excluded_units: [{ unit_id: str, reason: "ad"|"masthead"|"page_furniture"|
+                    "teaser"|"index"|"table"|"other" }]
+```
+
+Every field that carries content is either an array of unit-id strings or a
+closed enum - there is nowhere in this schema for article prose to hide.
+Model config: `gemini-3.1-flash-lite`, `thinking_level=HIGH` (this is the
+hard reasoning task - multi-column reading order and article-boundary
+judgment), `temperature=0`. Cached on
+`hash(user_prompt + prompt_version + model_id)` so an unchanged page never
+re-calls the API (`gemini_client.py`); bump `gemini.prompt_version` in
+config/default.yaml to invalidate deliberately.
+
+## Assembly
+
+`assemble.py` expands each returned unit ID back to its stored text and
+concatenates. Two text variants are kept per field (headline, deck, byline,
+dateline, body, captions):
+
+- `*_raw`: plain concatenation (drop-cap fusion still applies - it's
+  structural, not a cleanup), no de-hyphenation.
+- cleaned (unsuffixed): additionally de-hyphenates a line-final hyphen
+  followed by a unit starting with a lowercase letter, logging every join
+  (article_id, field, the two unit IDs, and a text snippet around the seam)
+  into `dehyphenation_log` in the page's gold JSON for audit. De-hyphenation
+  happens only at assembly time, on how units are stitched together -
+  Phase 1's own stored text is never modified.
+
+## Span schema
+
+```
+span_id            str    stable within a page; NOT reading order (see below)
+page_num           int
+bbox               [x0, top, x1, bottom]  PDF points, top-down (distance
+                                            from page top - matches
+                                            pdfplumber's own rendering
+                                            convention and this package's
+                                            image pixel coordinates, so
+                                            bbox * (dpi/72) maps directly to
+                                            pixels with no axis flip)
+text               str    verbatim, exactly the concatenated pdfplumber
+                          glyph text for this span's characters
+font_name          str    embedded BaseFont name (subset prefix included)
+font_size          float
+is_bold            bool   inferred from font_name substring match (see
+                          config/default.yaml canary.bold_markers) - a HINT,
+                          not authoritative; subsetted newspaper fonts
+                          rarely expose usable style flags any other way
+is_italic          bool   same caveat as is_bold
+char_count         int    number of pdfplumber char objects in the span
+                          (an "fi" ligature is 1 char object, not 2)
+line_id            int    see "line_id and order_in_line" below
+order_in_line      int
+flags:
+  size_outlier     bool   font_size >= 3.0x that PAGE's modal font size
+                          (drop-cap / headline candidate - see below)
+  single_glyph     bool   char_count == 1
+  ends_with_hyphen bool   text.rstrip().endswith("-")
+```
+
+`size_outlier` conflates two different things by construction: a genuine
+drop-cap (isolated oversized initial letter) and a multi-character headline
+set in large type. `single_glyph` is what disambiguates them - a drop-cap is
+`size_outlier=true, single_glyph=true`; a headline span is
+`size_outlier=true, single_glyph=false`. Phase 1 does not attempt to tell
+these apart any further than that; it is Phase 2's job to decide what a
+size-outlier span means in context.
+
+### line_id and order_in_line
+
+These record a narrow, purely geometric fact: "these spans sit on the same
+visual row, in this left-to-right order." They are **not** a claim about
+reading order across the page. This newspaper synchronizes text baselines
+across all columns to a shared leading grid, so unrelated columns routinely
+share a y-band - line_id groups spans by shared row *and* horizontal
+continuity (see "Column fusion" below), so a page with 5 columns produces
+many distinct line_ids per physical row, one per column-run. Phase 2 must
+use span geometry (bbox), not line_id ordering, to reconstruct actual
+reading flow across columns.
+
+Likewise, `span_id` assignment order (row-band top-to-bottom, then
+left-to-right within a row-band) is for stable, human-debuggable
+identification only, inherited from the same non-goal as the original spec:
+Phase 1 does not attempt reading order, and stream order is not reading
+order either.
+
+## Column fusion: a real bug found and fixed during build
+
+The original design for `line_id`/`order_in_line` clustered characters into
+row-bands by y-position, then split each row-band into column-runs wherever
+the horizontal gap between consecutive characters exceeded a threshold
+calibrated from a *single* observed example (a photo caption block on page
+2, where two column headlines shared a y-band with a 130-370pt gap between
+them). That calibration was not representative: on page 1's ordinary body
+text, real column-to-column transitions were observed as small as **7.9pt**
+- because this newspaper's narrow multi-column body grid has much smaller
+gutters than the wide feature block used for the first measurement. A
+threshold high enough to avoid over-splitting body text (54pt) let real
+column transitions through unsplit, silently fusing two unrelated columns'
+text into a single span's text with no separator at all (verified: a span
+containing `"...the first" + "According to sources..."` fused end-to-end).
+
+The fix (`geometry.split_runs`, `config.thresholds.span_break_gap_ratio`):
+lower the split threshold to 0.5x font_size, which is below the smallest
+observed real column-transition gap (0.875x) but above ordinary same-column
+word-spacing (p999 = 0.28x, measured over 136k adjacent character pairs
+across all 18 pages). The two magnitudes are close enough on this
+newspaper's typography that no threshold cleanly separates "large
+legitimate gap" from "column transition" from "dropped glyph" in every
+case - but the failure modes are asymmetric: under-splitting *fuses*
+unrelated content into one misleading span (silent data corruption),
+while over-splitting only produces more numerous, still fully verbatim
+spans (harmless, and Phase 2 can always re-join spans that turn out to
+belong together). The threshold is set conservatively on the "split more"
+side of that asymmetry.
+
+This is also why the geometric canary (below) deliberately does **not**
+reuse this package's own line/span grouping for its word tokenization -
+doing so would reintroduce the exact same column-transition-vs-dropped-glyph
+ambiguity into a check whose entire purpose is discriminating a strict
+subset of it.
+
+## Ligature canary: why geometric, not dictionary-based
+
+The original design for a ligature-drop safety net was a dictionary check:
+extract every word, and flag any word that becomes a valid English word when
+an f-ligature (ff/fi/fl/ffi/ffl) is inserted at some position - the idea
+being that if a ligature glyph fails to extract on some future page, the
+resulting mangled word would be catchable this way.
+
+This was implemented and calibrated against docs/Newspaper.pdf (18 pages,
+using the `pyspellchecker` offline dictionary, chosen because it bundles its
+word list as package data with no network access needed at runtime - the
+container may not have a system wordlist, and this needed to be handled
+explicitly rather than silently skipped). It produced 0-11 false-positive
+"suspects" per page. Root causes:
+
+- **Hyphenated line-wrap fragments.** `"final"` wrapped as `"fi-"` / `"nal"`
+  leaves the fragment `"nal"`, which happens to be real (`"final"`) when
+  `"fi"` is prepended - a coincidence of English morphology, not a ligature
+  bug. Same pattern produced `nally`->`finally`, `ber`->`fiber`,
+  `nings`->`finings`, etc.
+- **Acronym collisions.** `"EWS"` (a common Indian government acronym,
+  Economically Weaker Section) collides with `"flews"` (an obscure but
+  dictionary-valid word for a dog's pendulous lip) when `"fl"` is inserted.
+- **Fundamental unfixability.** Inserting an f-ligature into a common short
+  word frequently produces another common word: `"at"->"flat"`,
+  `"our"->"flour"`, `"re"->"fire"`, `"ow"->"flow"`, `"ne"->"fine"`,
+  `"sh"->"fish"`. A frequency threshold cannot separate signal from noise
+  here, because `"at"` occurs dozens of times per page and `"flat"` is a
+  common word - and the motivating failure case has exactly this shape:
+  page 1 contains "remained flat in August"; a dictionary canary cannot tell
+  a genuine dropped ligature (which would turn this into "remained at in
+  August" - grammatical, plausible, and wrong) apart from the dozens of
+  legitimate occurrences of "at" elsewhere on the page.
+
+**Replacement: a geometric canary** (`hindu_extract/canary.py`). Within each
+word - tokenized via `pdfplumber`'s own `extract_words()`, not this
+package's span grouping (see "Column fusion" above for why) - the gap
+between adjacent characters is compared to `kerning_gap_ratio * font_size`
+(default 0.75, calibrated: p999 of 136k measured intra-word gaps on this PDF
+is 0.28x, and the single largest legitimate gap observed, 0.60x, is a
+decorative leader-dot font abutting a numeral on page 11's stock ticker -
+see below). A gap exceeding this ratio means a glyph - most plausibly an
+f-ligature - failed to extract, leaving an unexplained hole roughly the
+width of the missing glyph. This has no dictionary, no acronym problem, and
+no frequency tuning: it inspects the extraction geometry directly rather
+than guessing about English morphology.
+
+The canary separately flags any raw character object pdfplumber reports
+with empty/unmapped text, since pdfplumber can return a positioned glyph
+with no resolvable Unicode text rather than omitting it outright - a
+failure mode the gap check alone would not catch.
+
+**Result on this PDF: 0 findings across all 18 pages** (full run log kept
+during development). Any non-zero result should be treated as a real signal
+worth a human look, not routine noise.
+
+## Other structural findings from initial inspection
+
+- **ToUnicode CMaps are not universally absent.** Page 1 (and most pages)
+  extract via WinAnsi/Differences encoding with zero fonts carrying a
+  ToUnicode CMap. Pages 2 and 11 each have 1-2 fonts (out of 15-20) that
+  *do* carry one. Do not assume page-1 behavior generalizes to the rest of
+  an edition, or to future editions if the publisher's prepress toolchain
+  changes - this is exactly why the font inventory (`PageMetadata.fonts`,
+  including `has_tounicode` per font) is recorded per page rather than
+  assumed.
+- **Page 5 is a full-page image ad**, not an extraction failure: only 68
+  characters extract (the masthead line + print registration marks); the
+  rest of the page is 70 embedded images. The survey report's coverage
+  column exists specifically to make pages like this visible at a glance.
+- **Leader-dot decorative fonts extract as a literal repeated letter.**
+  Page 11's stock-ticker row (`"Sensex ⋯ 81,905 ⋯ 0.44"`) uses a single-glyph
+  font (`THDots-Regular`, WinAnsi encoding, `FirstChar=LastChar=100`) whose
+  only defined glyph happens to sit at the codepoint for `'d'`. The text
+  layer for the leader dots is therefore a literal run of `'d'` characters,
+  not corruption - the visual result renders correctly as dots. Phase 1
+  preserves this verbatim as instructed; the font_name/font_size metadata
+  (a distinct font at a distinct, smaller size from surrounding text) is
+  what lets Phase 2 recognize and ignore it later, exactly the "record
+  ambiguity as metadata" principle this package follows throughout.
+
+## Rendering
+
+Two tiers, deliberately asymmetric in persistence (config/default.yaml
+`render` section):
+
+- **Vision image (~1.25MP)**: persisted per page in the bronze layer, for
+  Phase 2's vision pass. Resolution is derived from the target megapixel
+  count and this PDF's fixed page size (992.1 x 1530.7pt), not hardcoded.
+- **High-res (300 DPI) and the span_id debug overlay**: generated on demand
+  for a single page via the CLI (`render-hires`, `debug-overlay`), never
+  persisted for all pages by default. Newspaper body text (~8-9pt) is
+  marginal to inspect at 150 DPI, but persisting 300 DPI renders for all 18
+  pages of every daily edition would be hundreds of MB for images opened
+  rarely (debugging, and later, Phase 2's region crops). The debug overlay
+  draws each span's bbox and span_id, color-coded red for `size_outlier`
+  spans, for visual QA of the extraction.
+
+## Metrics (Phase 3)
+
+| Metric | Definition | Measurable now? | Result |
+|---|---|---|---|
+| Partition completeness | every unit_id assigned to exactly one article or excluded_units | Yes - `phase3.check_partition`, run per page by `articles_pipeline.process_page_articles` | Run `hindu-extract articles` and check the printed `partition=OK/NEEDS REVIEW` column, or `gold/{edition}/{date}/page_NN/articles.json`'s `partition_ok` field |
+| Partition duplication | no unit_id assigned to more than one location | Yes - same check, `PartitionResult.duplicated` | as above |
+| Hallucination rate | fraction of pages where the model invented a unit_id not in the input (this doubles as the "model returned text, not IDs" check) | Yes - `PartitionResult.hallucinated` | as above |
+| Retry recovery rate | fraction of initially-failed pages that pass after the one cited-failure retry, vs. falling through to needs_review | Yes - `GroupingOutcome.attempts` vs `needs_review` per page | not yet run across a full edition |
+| Seam continuity rate | fraction of article seams that read as continuous prose | **No** - deferred; needs an LLM-judge pass, not built in this minimal Phase 3 | |
+| Self-consistency rate | fraction of articles unchanged across repeated Phase 2 runs on the same input | **No** - deferred; needs repeated non-cached calls at temperature>0 or multiple samples, not built | |
+| Drop-cap resolution accuracy | fraction of `single_glyph & size_outlier` units correctly fused as the first character of a body | Partially - `assemble.py`'s fusion is deterministic once the model places the unit correctly, but whether the model places it *correctly* (vs. e.g. skipping it into excluded_units) is not yet measured systematically | |
+| Manual QA sample accuracy | fraction of a human-reviewed article sample judged correct | **No** - inherently manual | |
+
+## PressDigest: frontend + API
+
+A FastAPI backend (`hindu_extract/api/`) is a thin read layer over the gold
+JSON already on disk, plus job orchestration for kicking off extraction; a
+React + Vite + TypeScript frontend (`frontend/`) reads it. Neither layer
+reimplements extraction logic - the API imports `pipeline.extract_pages`
+and `articles_pipeline.process_page_articles` directly, exactly as the CLI
+does.
+
+**Status at time of writing:** the job system, edition-identity parsing,
+edition listing, coordinate-mapping math (verified against a real fixture),
+and the Dashboard + empty-state screens are built and tested. The
+article-shaped endpoints (`GET /api/editions/{id}/pages/{n}`,
+`GET /api/editions/{id}/articles`) and the Page Reader's article list are
+deliberately not yet built - see "Building the frontend against the live
+schema" below for why, and check back once a live Phase 2 run has
+completed.
+
+### Edition identity: parsed from the masthead, not user-typed
+
+The dashboard is drag-and-drop with no metadata form, but the storage layer
+is keyed on (edition, date). Rather than defaulting `date` to "today" (silently
+wrong for a back-dated PDF, corrupting the storage key) or forcing the user
+to hand-type it, `api/metadata_parser.py` reads it directly from the page-1
+masthead text Phase 1 already extracts:
+
+- **date**: the first span matching `Month D(D), YYYY`.
+- **edition**: a short ALL-CAPS alphabetic span immediately followed by a
+  span containing "EDITION" (case-insensitive) - a structural pattern
+  (verified: `DELHI` -> `CITY EDITION` on docs/Newspaper.pdf) that should
+  hold for any city edition of this newspaper, not just Delhi, without
+  hardcoding a city list.
+
+Either field parses to `None` if not found, and the frontend falls back to
+an editable (but pre-filled when possible) text field rather than silently
+guessing - `POST /api/editions/parse-metadata` returns the parsed values,
+and the actual extraction call `POST /api/editions` takes whatever the user
+confirmed.
+
+`edition_id` used in URLs is `f"{edition}__{date}"` (`api/edition_id.py`) -
+an opaque, round-trippable string so routes only need one path parameter.
+
+### Background jobs
+
+`api/jobs.py` holds an in-memory job registry (`dict[job_id, JobRecord]`,
+guarded by a lock) and runs each extraction on a `ThreadPoolExecutor` -
+deliberately not asyncio directly, since the underlying work
+(pdfplumber parsing, synchronous google-genai calls) is blocking, not
+async-native. In-memory is a deliberate v1 choice: this is a local-dev
+single-process app, restart-and-reupload is already cheap because of the
+Phase 1/Phase 2 caches, so job state doesn't need to survive a process
+restart yet.
+
+Per-page progress is real, not simulated: `pipeline.extract_pages` gained
+an optional `progress_callback` parameter (default `None`, fully backward
+compatible - existing callers and tests are unaffected) invoked once per
+page as Phase 1 completes it, and the job runner calls
+`articles_pipeline.process_page_articles` in its own per-page loop exactly
+as the CLI's `articles` command does, updating `pages_done` and per-page
+status after each one. A single page's Phase 2 failure is caught and
+recorded on that page (`status: "failed"`, `error: <message>`) without
+aborting the rest of the job - `write_edition_markdown` was fixed to skip
+pages with no gold JSON rather than crash, so one bad page no longer flips
+the *entire* job to `failed` (found via manual testing: it originally did).
+Cache hits are surfaced per page (`cached: bool`) and in aggregate
+(`all_cached`) so a re-upload of an identical PDF visibly says "served from
+cache" instead of looking broken by finishing suspiciously fast.
+
+### API contract (built so far)
+
+```
+POST   /api/editions/parse-metadata   multipart file -> ParsedMetadataOut
+                                        { edition: str|null, date: str|null }
+POST   /api/editions                  multipart file + ?edition=&date=
+                                        -> StartJobOut { job_id, edition, date }
+GET    /api/jobs/{job_id}             -> JobStatusOut
+                                        { job_id, edition, date,
+                                          status: queued|running|done|failed,
+                                          pages_done, pages_total,
+                                          per_page: [{ page_num,
+                                            status: pending|extracting|
+                                                    grouping|done|failed,
+                                            articles_found, partition_ok,
+                                            needs_review, cached, error }],
+                                          all_cached, error }
+GET    /api/editions                  -> EditionSummaryOut[]
+                                        { edition_id, edition, date,
+                                          page_count, article_count }
+GET    /api/editions/{edition_id}     -> EditionDetailOut (summary +
+                                          pages_with_articles,
+                                          pages_with_zero_articles)
+GET    /api/editions/{edition_id}/pdf -> the stored source PDF (for PDF.js)
+```
+
+Pending live schema (see below):
+`GET /api/editions/{edition_id}/pages/{n}`, `GET /api/editions/{edition_id}/articles`.
+
+TypeScript types are generated from these Pydantic models by
+`scripts/generate_types.py` into `frontend/src/types/api.ts` - run it
+whenever `hindu_extract/api/schemas.py` changes. (Implementation note: each
+model is run through `json2ts` independently rather than as one combined
+schema, because Pydantic gives every field its own `title`, which json2ts
+hoists into a top-level named alias - colliding across models that share a
+field name, e.g. two different `Edition` aliases. The generator strips
+non-root titles before conversion and de-duplicates identical interface
+re-declarations that come from shared nested models like `PagePhaseOut`.)
+
+### Coordinate mapping (verified against a real fixture)
+
+Three coordinate systems disagree about where "up" is, and conflating any
+two of them is the classic bug in this kind of overlay:
+
+- **Raw PDF space**: origin bottom-left, y increases *upward*.
+- **Our bbox** `(x0, top, x1, bottom)`, inherited from pdfplumber: origin
+  top-left, y increases *downward* - already flipped to match normal
+  screen/image conventions (see "Span schema" above). This is what the API
+  serves.
+- **PDF.js's rendered viewport**: also top-left origin, y increases
+  downward (it matches the canvas it draws into) - but its own
+  `viewport.convertToViewportPoint(x, y)` expects *raw PDF-space* input and
+  applies the flip itself.
+
+Feeding our already-top-down bbox straight into `convertToViewportPoint`
+flips it a second time, mirroring the overlay vertically. The fix
+(`frontend/src/lib/coords.ts::bboxToViewportRect`): un-flip our bbox back
+to raw PDF space (`pageHeightPt - y`) before handing it to PDF.js's own
+transform, rather than hand-rolling a scale-only shortcut that would
+silently break under page rotation.
+
+Verified in `frontend/src/lib/coords.test.ts` by loading the real
+docs/Newspaper.pdf (not a synthetic viewBox) and checking the page-1
+headline bbox (`"Karki is Nepal's first woman PM"`, top-down
+`top≈336, bottom≈378` out of a 1530.71pt-tall page) lands in the top third
+of the rendered viewport, not mirrored to `top≈1152` (~75% down the page) -
+which is exactly where the naive double-flip bug would place it.
+
+### No vision pass; article overlay is span-schema-only
+
+An article's highlight is the union of its constituent units' bboxes
+(`frontend/src/lib/coords.ts::unionBbox`), computed client-side from
+whatever unit bboxes the (pending) page-articles endpoint returns - no
+separate geometry computation or vision model is needed for this.
+
+### Building the frontend against the live schema
+
+The article-shaped API responses and the Page Reader's left pane
+(headline/deck/byline/dateline/body/captions rendering, the confidence
+badge, truncation/needs_review markers, the raw-text toggle) are
+deliberately not built yet, per instruction: "I don't want it built against
+a schema the model has never actually produced." `assemble.py`'s
+`AssembledArticle.to_dict()` is the presumptive shape, but until a live
+Gemini call has actually populated `data/gold/`, building `ArticleOut` and
+the card component against it risks silently encoding an assumption (field
+presence, whether a field can be an empty string vs. absent, how the model
+actually populates `confidence` in practice) that the real pipeline
+contradicts. This is the same reasoning as Phase 1/2's core discipline:
+verify against real data before encoding an assumption into a schema
+other code depends on.
+
+### UI slots awaiting a later pipeline phase
+
+| UI element | Status | Waiting on |
+|---|---|---|
+| Dashboard upload + job progress | Built | - |
+| Edition list | Built | - |
+| Page Reader: PDF.js rendering + zoom | Built | - |
+| Page Reader: article list, confidence badge, coordinate overlay | Not built | Live Phase 2 gold JSON (see above) |
+| Summaries: empty state | Built | - |
+| Summaries: 20-card ranked grid (`SummaryCardGrid`, present but unused) | Built, feature-flagged off | Ranking + summarisation pipeline (not started) |
+| AI Chat | Empty state only | Chat/RAG pipeline (not started) |
+
+## Stream-order rebuild
+
+Phase 1's geometric layer (row/column clustering, `column_major_order`,
+the span/unit/block hierarchy) and Phase 2's unit-ID grouping+ordering
+architecture were both replaced. Root cause: three consecutive live runs
+under the old architecture (see the "ID ranges: tried and reverted"
+history above) either truncated or produced scrambled article bodies,
+because ordering ~200-400 small units by hand is exactly the kind of
+large-scale bookkeeping a model does unreliably, however the prompt was
+tuned.
+
+### The diagnostic that changed the design
+
+Verified directly against `docs/Newspaper.pdf` (not assumed): take
+`page.chars` in **raw, untouched content-stream order** - no sort by (top,
+x0), no clustering - and group consecutive chars into lines using only the
+existing separator threshold (`span_break_gap_ratio`). The result, on both
+page 1 and page 8 (a dense, normal multi-article inner page):
+
+- An article's **body always occupies one single contiguous run** of
+  stream-ordered lines, correctly threading across all of its columns,
+  with zero interleaving from any other story. Confirmed on 3+ consecutive
+  stories across two pages.
+- A drop-cap sits **directly adjacent**, in stream order, to the text it
+  fuses with (`"N"` immediately followed by `"epal President Ram"`).
+- **Furniture is not contiguous.** A story's headline can be dozens of
+  lines away from its own deck, with unrelated stories' teasers sitting in
+  between (verified: page 1's Nepal headline at line 197, its deck at
+  lines 225-228, with three other stories' teasers at 205-224 in between).
+
+This one property - body is always one contiguous slice - is what the
+entire rebuild exploits: the model's job changed from "select and order
+every small piece" (unreliable) to "find where a handful of fields start
+and end" (a much smaller, checkable task).
+
+### What changed
+
+**Phase 1** (`lines.py`, replacing `spans.py`/`geometry.py`/the row-banding
+apparatus): walks `page.chars` in native stream order in a single forward
+pass, grouping into `Line` records. No global sort, no column-run
+splitting, no style-run splitting. Two rules only, checked against the
+immediately preceding char:
+1. An outlier-sized char (drop-cap or headline, `size_outlier`) never
+   merges with a non-outlier one - this is what keeps a drop-cap isolated
+   as its own line deterministically, rather than hoping the row/gap check
+   happens to separate it by coincidence.
+2. Otherwise, the same already-validated same-row + gap threshold as
+   before (`row_band_tolerance_ratio`, `span_break_gap_ratio`), just
+   applied to consecutive stream chars instead of a globally-sorted list.
+
+Every char now carries a `stream_index` (position in `page.chars`); each
+`Line` stores `stream_start`/`stream_end` from its chars, so stream
+position survives in the persisted bronze JSON (previously it didn't -
+`verify.py`'s old fidelity check reconstructed it via `id(c)` against a
+live, in-process `page.chars` list, which can't survive a process
+boundary). `Line.line_no` is 1-based, assigned in the same stream-walk
+order - it is not re-sorted afterward, unlike the old `unit_id` scheme's
+`column_major_order` pass.
+
+**Phase 2** (`gemini_prompt.py`, `phase3.py`, `assemble.py`): the model
+receives a numbered line dump (`L<line_no>|<font_size>|<text>`) and
+returns line-number **boundaries** per article field
+(`{start, end, start_words[, end_words]}`), not a selected/ordered list of
+IDs. `headline`/`byline`/`dateline` are single ranges (byline/dateline
+nullable); `deck`/`caption` are **lists** of ranges, since furniture is not
+guaranteed contiguous with itself. `excluded_units` from the previous
+architecture is gone entirely - anything not inside any article's ranges
+is excluded by construction (a derived set complement), never enumerated.
+
+### ID ranges: tried and reverted
+
+An earlier version of the (now-deleted) unit-ID architecture added compact
+ID-range shorthand (`"p001-L0068-L0090"`) to cut output size after a real
+HIGH-thinking run hit Flash-Lite's 65,536-token completion ceiling
+(thoughts + candidates together) with an explicit `excluded_units` list.
+Removing `excluded_units` was what actually fixed the truncation; the
+ranges bought nothing but did real damage: they gave the model an output
+form that costs the same whether right or wrong (a wrong range costs 8
+tokens, same as a right one), so guessing a plausible-looking range was
+the path of least resistance, and a run of consecutive unit-IDs frequently
+spanned two or more genuinely unrelated reading chains that happened to
+land on adjacent numbers (the old `column_major_order` numbering had no
+gap or marker between chains). Verified live: a single 30-ID range spanned
+three distinct chains, producing a badly scrambled body. Ranges were
+removed entirely; every ID-list field in that architecture went back to
+individual IDs. That whole ID-selection architecture is now gone in favor
+of the boundary-finding approach above, which sidesteps the problem
+category rather than patching it - there is no equivalent "range" concept
+in the (start, end) line-number boundaries, because a boundary is a single
+claim to verify, not a list of individual guesses.
+
+### Gemini 3.x thinking tokens count against the output ceiling
+
+Flash-Lite has one fixed completion-token ceiling (65,536) shared between
+`thoughts_token_count` and `candidates_token_count` - raising
+`max_output_tokens` does not add budget beyond that hard limit, and
+thinking length at a given `thinking_level` is not fixed: two runs of the
+*old* architecture at HIGH, with `max_output_tokens` raised from 32,768 to
+49,152, saw thinking grow from 31,455 to 47,181 tokens and still get cut
+off - thinking appears to expand to consume whatever headroom is given
+rather than converging to a stable length for a given task. Under the new
+boundary-finding architecture, the task is small enough that this stopped
+mattering in practice: a live HIGH-thinking run on page 1 used 47,183
+thinking tokens but only needed 583 candidate tokens to express ~300
+tokens worth of boundaries, comfortably inside the 49,152 cap with margin
+before the 65,536 hard ceiling.
+
+### Checksum validation must use real join semantics
+
+`start_words`/`end_words` are a few words the model copies from the line
+dump to let Phase 3 verify a claimed boundary independently. The first
+implementation of the checksum check sliced lines with a naive
+`"".join(line.text for line in range(start, end+1))` - no separator - and
+falsely flagged live, correct output as a mismatch: consecutive lines
+"Ram" and "Chandra Poudel ap-" concatenated to "RamChandra Poudel ap-",
+which doesn't start with the model's (correct) checksum "Ram Chandra".
+Fixed by having the checksum check call `assemble.py`'s actual line-joining
+function (drop-cap fusion + de-hyphenation-aware spacing) instead of
+reimplementing a simplified join - the two must agree, or the check
+validates against text that will never actually appear in output.
+
+A second, narrower discrepancy survived that fix: a checksum spanning a
+drop-cap boundary (e.g. `"N epal President Ram"`) naturally includes a
+space, because the model transcribes words as they appear on **separate
+rows** in the line dump - but the real, correctly-fused text has none
+(`"Nepal President Ram"`, per the drop-cap rule). This is not evidence of
+a wrong boundary (verified live: the range itself was exactly correct);
+`phase3.py`'s checksum match therefore falls back to a whitespace-stripped
+comparison before declaring a mismatch, which tolerates this specific,
+understood formatting artifact without weakening the check's ability to
+catch a genuinely wrong boundary (which would put different *words* at the
+edge, not just different spacing).
+
+### Multi-rect bodies
+
+An article's highlight is no longer one union bbox. `assemble.py` splits a
+body's lines (already in stream/line_no order) into geometric fragments
+wherever consecutive lines are not visually adjacent (a large vertical or
+horizontal jump, i.e. a column change) and returns one bbox per fragment -
+a rendering aid only; text assembly never depends on it.
+
+### Live validation result (page 1, docs/Newspaper.pdf)
+
+One real call, `thinking_level=HIGH`, `max_output_tokens=49152`,
+`prompt_version=v4`: 5,194 prompt tokens, 47,183 thinking tokens, 583
+candidate tokens, 98.95s wall-clock. Both articles' body ranges matched
+Step 1's independently-verified ground truth exactly (Nepal L57-196,
+retail-inflation L229-264), the non-contiguous deck case was found
+correctly (L225-228, with unrelated teasers in between), all checksums
+passed (after the fixes above), zero contiguity issues, zero overlap,
+coverage 66% (191/289 lines - the rest is masthead, teasers, and other
+pages' furniture, none of it wrongly captured). Both assembled bodies read
+as fully correct, continuous, grammatically coherent prose end to end -
+"meetings" present, "meetNings" nowhere, drop-cap "N" leading the body
+with no stray space.
