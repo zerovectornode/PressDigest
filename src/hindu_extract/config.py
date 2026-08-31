@@ -87,32 +87,49 @@ class Config:
     project_root: Path
 
     @property
+    def data_anchor(self) -> Path:
+        """Where paths.* (all of which are "data/..." strings, e.g.
+        "data/bronze") resolve relative to. Defaults to project_root, same
+        as always; HINDU_EXTRACT_DATA_ROOT overrides it so a deployment can
+        put actual pipeline output on a separate volume/directory from the
+        application code without touching a single path string in
+        config/default.yaml - see design/DESIGN.md "Deployment: GCP
+        e2-micro VM" (data lives at /var/lib/pressdigest, app code at
+        /opt/pressdigest/app, so a redeploy's rsync - which never touches
+        /var/lib/pressdigest - can't lose extracted editions). Checked live
+        rather than baked in at load_config time so it behaves like every
+        other env override in this module.
+        """
+        override = os.environ.get("HINDU_EXTRACT_DATA_ROOT")
+        return Path(override) if override else self.project_root
+
+    @property
     def bronze_root(self) -> Path:
-        return self.project_root / self.paths.bronze_root
+        return self.data_anchor / self.paths.bronze_root
 
     @property
     def cache_root(self) -> Path:
-        return self.project_root / self.paths.cache_root
+        return self.data_anchor / self.paths.cache_root
 
     @property
     def gold_root(self) -> Path:
-        return self.project_root / self.paths.gold_root
+        return self.data_anchor / self.paths.gold_root
 
     @property
     def raw_pdf_root(self) -> Path:
-        return self.project_root / self.paths.raw_pdf_root
+        return self.data_anchor / self.paths.raw_pdf_root
 
     @property
     def gemini_cache_root(self) -> Path:
-        return self.project_root / self.paths.gemini_cache_root
+        return self.data_anchor / self.paths.gemini_cache_root
 
     @property
     def trace_db(self) -> Path:
-        return self.project_root / self.paths.trace_db
+        return self.data_anchor / self.paths.trace_db
 
     @property
     def ranking_cache_root(self) -> Path:
-        return self.project_root / self.paths.ranking_cache_root
+        return self.data_anchor / self.paths.ranking_cache_root
 
 
 

@@ -1,0 +1,61 @@
+# Caddy config for PressDigest. Reverse-proxies to uvicorn on
+# 127.0.0.1:8000, terminates mandatory HTTP Basic auth (this serves The
+# Hindu's verbatim text/PDF on a public IP - non-negotiable), and sets
+# cache headers sized against the tightest real budget on this VM.
+#
+# {$SITE_ADDRESS} is read from the caddy process's own environment (see
+# setup.sh's systemd drop-in, EnvironmentFile=/etc/pressdigest/caddy.env)
+# so the SAME file works before DNS exists (defaults to bare HTTP on :80,
+# no TLS attempted - Caddy only tries automatic HTTPS for an address that
+# looks like a real domain) and after: set SITE_ADDRESS to the DuckDNS
+# hostname once it and port 443 are ready, restart caddy, and it
+# provisions + auto-renews a Let's Encrypt cert with no other change here.
+{$SITE_ADDRESS:http://:80} {
+	encode gzip zstd
+
+	# Mutually exclusive by construction (the pdf/assets matchers are
+	# excluded from api_other) rather than relying on directive order to
+	# make a later, more-specific header win over an earlier general one -
+	# there's no local Caddy instance to verify that ordering against.
+	@pdf {
+		path /api/editions/*/pdf
+	}
+	@api_other {
+		path /api/*
+		not path /api/editions/*/pdf
+	}
+	@assets {
+		path /assets/*
+	}
+	@html {
+		not path /assets/*
+		not path /api/*
+	}
+
+	basic_auth {
+		{$BASIC_AUTH_USER} {$BASIC_AUTH_HASH}
+	}
+
+	# The raw PDF an edition was extracted from never changes once
+	# uploaded (no edit/replace flow exists) - cached for a week. Egress
+	# is NOT the tight budget on this deployment (200GB/mo Standard tier),
+	# but re-fetching a 10-40MB PDF on every reader-page visit is still
+	# pointless latency/CPU for both ends.
+	header @pdf Cache-Control "public, max-age=604800"
+
+	# Every other /api/* response reflects live pipeline state (job
+	# status, edition list, trace data) - must never be cached.
+	header @api_other Cache-Control "no-store"
+
+	# Vite's build gives every JS/CSS/font asset a content-hash filename,
+	# so a given URL never changes meaning - safe to cache for a year.
+	header @assets Cache-Control "public, max-age=31536000, immutable"
+
+	# The SPA shell (index.html, served for every client-side route via
+	# the FastAPI catch-all) must NOT be cached long-term: it references
+	# the CURRENT build's hashed asset filenames, and a stale cached copy
+	# after a deploy would point at asset files that no longer exist.
+	header @html Cache-Control "no-cache"
+
+	reverse_proxy 127.0.0.1:8000
+}

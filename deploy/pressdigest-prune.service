@@ -1,0 +1,20 @@
+[Unit]
+Description=PressDigest: prune editions/cache older than the retention window
+# Not After=pressdigest.service and not a hard dependency on it - pruning
+# is a pure filesystem operation independent of whether the API process
+# happens to be up, and should still run even if pressdigest.service is
+# down for some other reason.
+
+[Service]
+Type=oneshot
+User=pressdigest
+Group=pressdigest
+Environment=PRESSDIGEST_RETENTION_DAYS=30
+ExecStart=/opt/pressdigest/venv/bin/python /opt/pressdigest/app/deploy/prune_editions.py \
+    --data-root /var/lib/pressdigest/data \
+    --days ${PRESSDIGEST_RETENTION_DAYS}
+
+# Change the retention window without editing this file: drop an
+# override in /etc/systemd/system/pressdigest-prune.service.d/*.conf
+# setting a different Environment=PRESSDIGEST_RETENTION_DAYS=N, then
+# `systemctl daemon-reload`.

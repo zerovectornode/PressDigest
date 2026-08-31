@@ -1201,93 +1201,163 @@ longer what's actually deployed.
 No Docker (a constraint of the deploying machine, not a technical
 requirement - the app has none of its own), and no local way to test any
 of this before it runs on the real VM either, the same situation as the
-HF attempt above. Bare VM: systemd runs uvicorn directly, nginx reverse-
-proxies and terminates Basic Auth in front of it. Every file lives under
-`deploy/` (`pressdigest.service`, `nginx-pressdigest.conf`, `setup.sh`,
-`deploy.sh`, `pressdigest.env.example`).
+HF attempt above. Bare VM (project `free-tier-sandbox-507212`, zone
+`us-central1-a`, Debian 12, 1GB RAM, 30GB pd-standard, 2GB swap): systemd
+runs uvicorn directly, **Caddy** reverse-proxies and terminates Basic Auth
++ TLS in front of it. Every file lives under `deploy/`
+(`pressdigest.service`, `Caddyfile`, `setup.sh`, `deploy.sh`,
+`requirements.txt`, `env.example`, `caddy.env.example`,
+`prune_editions.py`, `pressdigest-prune.service`/`.timer`).
 
-**The frontend is built locally, never on the VM.** `e2-micro` has 1GB
-RAM (shared-core CPU on top of that); `npm run build`'s toolchain
-(esbuild/rollup, both memory-hungry) is a real OOM risk there, and there's
-nothing gained by building on a weaker machine than the one already doing
-it locally. `deploy.sh` runs `npm run build` on the laptop and ships only
-the resulting `frontend/dist/` - never `node_modules`, never a build step
-that has to succeed on the VM.
+**Caddy, not nginx+certbot** - fewer moving parts on a machine with no
+local way to debug a misconfiguration. One short `Caddyfile` gets
+automatic TLS with renewal, Basic Auth, gzip, and path-scoped cache
+headers, versus nginx's static config plus certbot as a separate
+tool/cron job/renewal-failure mode to reason about independently. The
+site address is parameterized via `{$SITE_ADDRESS}` (read from Caddy's
+own process environment, injected through a systemd drop-in at
+`/etc/systemd/system/caddy.service.d/override.conf` pointing at
+`/etc/pressdigest/caddy.env`) specifically so the *same* Caddyfile is
+correct both before DNS exists (`http://:80`, no TLS attempted - Caddy
+only tries automatic HTTPS for an address that looks like a real domain)
+and after (set it to the DuckDNS hostname and restart - that alone
+triggers certificate issuance, no other change).
 
-**Ownership: root owns the code and venv, only `data/` belongs to the
-service's own user.** This resolves a real conflict rather than being an
-arbitrary choice: a setuptools *editable* install (`pip install -e`, kept
-for the same `Path(__file__)`-anchored config-path resolution reason as
-the earlier Docker work) writes an `egg-info` directory back into the
-source tree, which needs the installing user to have write access to
-that tree - if `pressdigest` (the low-privilege service user) owned the
-code, either every deploy would need to run pip as that user with a
-separate permission dance, or the deploy step would need root anyway and
-fight the ownership it just set. Simplest resolution: `deploy.sh`'s rsync
-runs as root on the remote side (`--rsync-path="sudo rsync"`), pip install
-runs as root too, and only `/opt/pressdigest/app/data` - explicitly
-excluded from rsync's reach - is chowned to `pressdigest` once by
-`setup.sh` and never touched again. The systemd unit's own hardening
-(`ProtectSystem=strict`, `ReadWritePaths=/opt/pressdigest/app/data`) is
-the actual write-access enforcement; the Unix ownership is what makes
-that boundary line up with a directory the service can still write to at
-all.
+**Extraction is on-demand, not scheduled** - triggered by a user's PDF
+upload, ~90s of mostly Gemini network wait per edition, not sustained
+CPU. This matters for what "page-by-page" actually means here: it's not
+about batching or a job queue, it's about not holding all 18 pages'
+character data in memory during one request. Verified directly against
+the installed pdfplumber 0.11.10 + pdfminer.six source (not assumed):
+`PDF.pages` only builds lightweight per-page wrapper objects up front
+(page-tree attributes - MediaBox, Rotate, an unresolved reference to the
+content stream); the actual content-stream decompression
+(`PDFPage.get_data()`/zlib inflate) only happens inside
+`Page.layout`, a property triggered lazily the first time that specific
+page's `.chars`/`.objects`/`.rects` is touched - and nothing in this
+codebase's extraction loop touches any page but the one currently being
+processed. So page N+1's character data is genuinely never resident
+while processing page N; no re-opening-per-page or manual cache-clearing
+was needed, the existing loop already had this property by construction.
+`--workers 1` (below) is the part that actually needed setting explicitly
+- a second uvicorn worker would double memory for zero benefit, since the
+bottleneck is Gemini's network round-trip, not CPU.
 
-**Concurrency turned down, and made env-overridable rather than forked
-into a second config file.** `config/default.yaml`'s
-`concurrency.max_concurrent: 4` was calibrated against local runs on a
-real (non-shared-core) CPU; the e2-micro's shared-core vCPUs are a
-materially weaker, noisier-neighbor environment, so production runs at 2
-as a safety margin. Rejected a full `config/production.yaml`: it would
-duplicate default.yaml's ~220 lines of calibration comments almost
-entirely unchanged, for the sake of one differing value, with a real risk
-of the two files silently drifting apart on everything else over time.
-`config.py`'s `load_config` instead checks `HINDU_EXTRACT_MAX_CONCURRENT`
-(and could grow more entries the same way) and overrides just that key
-after loading the YAML - unset in local dev, so default.yaml's own value
-applies unchanged there.
+**No pip install of the app's own package - PYTHONPATH instead.** This
+replaced an editable install (`pip install -e .`) considered for the
+earlier HF/nginx design. An editable install writes an `egg-info`
+directory back into the source tree, which needs the installing identity
+to have write access there; `pressdigest.service` instead sets
+`Environment=PYTHONPATH=/opt/pressdigest/app/src` and imports
+`hindu_extract` straight from the rsynced source, no install step for the
+app itself at all. `deploy/requirements.txt` covers only third-party
+dependencies, installed into the venv with `pip install --no-cache-dir`
+(saves disk and the transient RAM `pip`'s wheel cache would otherwise
+use) - and only when the file's hash has changed since the last deploy,
+so a routine code-only update doesn't re-run pip at all.
 
-**Cache headers, sized against the tightest real budget: 1GB/month free
-egress**, not CPU or RAM. Vite's build gives every JS/CSS/font asset a
-content-hash filename, so `/assets/*` is cached for a year
-(`Cache-Control: immutable`) - a new build is always a new URL, there is
-no staleness risk. The raw PDF an edition was extracted from never
-changes once uploaded (no edit/replace flow exists), so
-`/api/editions/{id}/pdf` is cached for a week - without this, re-opening
-the same reader session re-downloads a ~20MB PDF every time, which alone
-could exhaust the monthly egress budget in a handful of sessions.
-Static assets are served directly by nginx from disk (`alias`, bypassing
-uvicorn entirely) rather than through the FastAPI catch-all that also
-handles this correctly - not for correctness (both work) but because the
-e2-micro's shared-core CPU shouldn't spend a Python process's cycles on a
-file nginx can serve itself.
+**Ownership follows from that.** `/opt/pressdigest` (app code + venv) and
+`/var/lib/pressdigest` (data) both start out owned by the `pressdigest`
+service user (`setup.sh`). After the first `deploy.sh` run,
+`/opt/pressdigest/app` becomes root-owned instead - the rsync runs as
+root over SSH (`--rsync-path="sudo rsync"`) because the SSH-connecting
+account (your own gcloud/OS Login identity) isn't `pressdigest` and has
+no other way to write into a directory it doesn't own. That's fine:
+`pressdigest.service` only ever *reads* `app/` (the PYTHONPATH import,
+never a write-back), and root-owned files are readable by default. The
+venv stays `pressdigest`-owned throughout, since `deploy.sh`'s pip step
+explicitly runs as `sudo -u pressdigest`. `/var/lib/pressdigest/data` is
+untouched by `deploy.sh` at all - it isn't on any path that script
+mentions - so a redeploy can never wipe an already-extracted edition.
+Systemd's own hardening (`ProtectSystem=strict`,
+`ReadWritePaths=/var/lib/pressdigest`) is the actual write-access
+enforcement on top of all of this, not the Unix ownership alone.
 
-**Basic Auth is non-negotiable, at the nginx layer, applied to every
-route** - set at `server` level in `nginx-pressdigest.conf` rather than
-per-location, specifically so a new route added later is protected by
-default instead of needing someone to remember to add auth to it. This
-serves copyrighted newspaper content to a public IP; there is no
-acceptable configuration of this deployment without it.
+**Data root is env-overridable, not hardcoded, and doesn't touch a single
+path string in config/default.yaml.** `config.py` gained a `data_anchor`
+property: every `paths.*` value (`"data/bronze"`, etc.) resolves relative
+to it, and it defaults to `project_root` (unchanged local-dev behavior)
+unless `HINDU_EXTRACT_DATA_ROOT` is set, in which case *that* becomes the
+anchor instead - `/var/lib/pressdigest`, on this deployment, giving
+`/var/lib/pressdigest/data/bronze` etc. without renaming a single key in
+the YAML. Same reasoning as `HINDU_EXTRACT_MAX_CONCURRENT` before it
+(also still present, default 2 here): a second config file for
+production would duplicate default.yaml's calibration comments almost
+entirely unchanged for the sake of values that need to differ in exactly
+one deployment.
 
-**TLS: recommended now, not deferred**, despite no domain being owned.
-Basic Auth's credentials are base64-encoded, not encrypted - sent in
-cleartext on every request over plain HTTP, trivially readable by
-anything on the network path. Serving Basic-Auth-protected content over
-HTTP is a real, immediate exposure, not a hardening nice-to-have to get to
-later. Cheapest correct path: a free DNS name from a provider like
-DuckDNS pointed at the VM's (reserved, static) external IP, then
-`certbot --nginx` for a free Let's Encrypt certificate with automatic
-renewal - both zero-cost, and `certbot`'s nginx plugin edits
-`nginx-pressdigest.conf`'s server block in place rather than requiring a
-hand-written HTTPS server block. (Caddy would get automatic TLS with even
-less configuration than certbot, but nginx was the explicit choice here,
-so certbot-on-nginx is the path that doesn't contradict that.)
+**Cache headers**: egress is explicitly *not* the constraint here (this
+VM's Standard network tier gives 200GB/month free, not the 1GB/month the
+original HF/nginx design was sized against) - the headers exist anyway,
+for latency and to avoid pointless repeated work on both ends, sized more
+loosely as a result. Vite's content-hashed `/assets/*` is cached a year
+(`immutable` - a new build is always a new URL). The per-edition PDF
+(`/api/editions/{id}/pdf`, immutable once uploaded) is cached a week. The
+SPA shell (`index.html`, served by FastAPI's catch-all for every
+client-side route) is explicitly `no-cache` - a stale cached copy after a
+deploy would reference asset filenames from the *previous* build that no
+longer exist, a real correctness bug a naive "cache everything" policy
+would introduce. Every other `/api/*` response is `no-store` (job status,
+edition list, trace data - all live pipeline state).
+
+**Basic Auth is non-negotiable, at the Caddy layer, applied to the whole
+site block** rather than scoped to specific paths, specifically so a
+route added later is protected by default instead of needing someone to
+remember to add auth to it. This serves copyrighted newspaper content to
+a public IP; there is no acceptable configuration of this deployment
+without it.
+
+**TLS via DuckDNS + Caddy's automatic HTTPS**, done as part of this
+deployment rather than deferred - Basic Auth's credentials are
+base64-encoded, not encrypted, sent in cleartext on every request over
+plain HTTP. Cheapest correct path: a free DuckDNS hostname pointed at the
+VM's (reserved, static) external IP, port 443 open, then set
+`SITE_ADDRESS` in `/etc/pressdigest/caddy.env` to that hostname and
+restart Caddy - it requests and renews the Let's Encrypt certificate
+itself, no certbot, no cron, no separate renewal-failure mode to monitor.
 
 **Static IP: reserve it.** An external IP costs nothing extra *while
 attached to a running instance* - GCP only bills a reserved static IP
 when it's sitting unattached (e.g. the VM is stopped but the reservation
 wasn't released). This is a long-running, always-on personal service, not
 something stopped and started often, so the practical cost is $0, and a
-stable IP is what makes the DuckDNS-plus-certbot TLS setup above possible
-at all - an ephemeral IP changes on certain restarts, silently breaking
-the DNS pointer.
+stable IP is what makes the DuckDNS TLS setup above possible at all - an
+ephemeral IP changes on certain restarts, silently breaking the DNS
+pointer.
+
+**Disk retention: pruning is necessary, not optional, on 30GB.** Uploaded
+PDFs run 10-40MB each, plus bronze/gold text and the Gemini response
+cache per edition; left unmanaged on a machine nobody watches day to day,
+this fills eventually. `deploy/prune_editions.py`, run daily via
+`pressdigest-prune.timer`, deletes `raw`/`bronze`/`gold` edition
+directories and independent `cache/` entries whose *own* mtime exceeds a
+configurable retention window (default 30 days) - deliberately not keyed
+off the newspaper's own publication date in the `{date}` path segment,
+since a months-old back issue uploaded today should get the same
+retention window as anything else, not be pruned on the very next run
+because its filename looks old. Cache entries are content-addressed, not
+edition-keyed, and fully re-derivable (re-running `extract` regenerates
+them) - safe to prune purely by their own age with no correlation to a
+specific edition needed.
+
+**Startup sanity logging** now also reports free RAM, swap status, and
+free disk (`main.py`'s `_log_system_stats`, parsed from `/proc/meminfo`
+and `shutil.disk_usage`, both no-ops/gracefully-skipped outside Linux) on
+top of the Python/package-version lines from the earlier HF attempt -
+this is the only window into an environment with no local reproduction,
+and a missing swapfile or a nearly-full disk should be visible in the
+first few `journalctl` lines, not discovered as an unexplained OOM kill
+or a failed write days later.
+
+**apt dependencies are deliberately generous, not minimal**, despite
+`design/DESIGN.md`'s own earlier finding (see "Removed: the unused
+vision-image render" and the original HF Dockerfile work) that nothing in
+this codebase's actual dependency chain needs poppler/ImageMagick/
+ghostscript - pypdfium2 bundles its own PDFium binary, and Pillow's
+wheels bundle libjpeg/libpng/etc. statically. That finding was reached
+with time to actually trace every code path; this VM has no local
+environment to catch a wrong guess before it ships, so `setup.sh` installs
+the full Pillow image-format library set, `libxml2`/`libxslt1.1`, and a
+compiler toolchain anyway, on the reasoning that the cost (a few hundred
+MB of disk, once) is negligible next to the cost of a crash that only
+reproduces on one specific PDF's font subset in front of a real user.

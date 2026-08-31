@@ -57,6 +57,59 @@ logging.basicConfig(
 _logger = logging.getLogger("hindu_extract.startup")
 
 
+def _proc_meminfo() -> dict[str, int] | None:
+    """Parses /proc/meminfo (Linux only - the e2-micro deployment; returns
+    None anywhere else, e.g. local Windows dev, rather than raising)."""
+    try:
+        text = Path("/proc/meminfo").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    out = {}
+    for line in text.splitlines():
+        key, _, rest = line.partition(":")
+        digits = rest.strip().split(" ")[0]
+        if digits.isdigit():
+            out[key] = int(digits) * 1024  # meminfo values are in kB
+    return out
+
+
+def _log_system_stats() -> None:
+    """The only window into this process's actual environment - see
+    design/DESIGN.md "Deployment: GCP e2-micro VM": free RAM and swap
+    status matter specifically because pip installing pdfplumber's
+    dependency tree, and extraction itself, have both been sized against
+    an assumption (2GB swap active) that a silent provisioning slip could
+    quietly violate."""
+    meminfo = _proc_meminfo()
+    if meminfo is not None:
+        mem_available = meminfo.get("MemAvailable")
+        swap_total = meminfo.get("SwapTotal")
+        swap_free = meminfo.get("SwapFree")
+        _logger.info(
+            "memory: available=%s swap_total=%s swap_free=%s%s",
+            f"{mem_available / 1e6:.0f}MB" if mem_available is not None else "unknown",
+            f"{swap_total / 1e6:.0f}MB" if swap_total is not None else "unknown",
+            f"{swap_free / 1e6:.0f}MB" if swap_free is not None else "unknown",
+            "" if swap_total else " (NO SWAP ACTIVE)",
+        )
+        if not swap_total:
+            _logger.warning("no swap active - see deploy/setup.sh; extraction may OOM under memory pressure")
+    else:
+        _logger.info("memory: /proc/meminfo unavailable (not Linux)")
+
+    try:
+        usage = shutil.disk_usage(config.data_anchor)
+        _logger.info(
+            "disk (%s): free=%.1fGB used=%.1fGB total=%.1fGB",
+            config.data_anchor,
+            usage.free / 1e9,
+            usage.used / 1e9,
+            usage.total / 1e9,
+        )
+    except OSError as e:
+        _logger.warning("disk usage check failed for %s: %s", config.data_anchor, e)
+
+
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
     """Runs once per process start. Neither deployment target this has run
@@ -64,9 +117,10 @@ async def _lifespan(app: FastAPI):
     DESIGN.md "Deployment") has had a local environment to iterate
     against, so a silent misconfiguration (data dir not writable, a
     dependency missing its expected version, a concurrency override that
-    didn't take) needs to be visible in the first few log lines rather
-    than surfacing later as an opaque 500 on first upload."""
-    data_dir = config.project_root / "data"
+    didn't take, swap not actually active) needs to be visible in the
+    first few log lines rather than surfacing later as an opaque 500 or a
+    silent OOM kill on first upload."""
+    data_dir = config.data_anchor / "data"
     data_dir.mkdir(parents=True, exist_ok=True)
     writable = os.access(data_dir, os.W_OK)
 
@@ -81,6 +135,7 @@ async def _lifespan(app: FastAPI):
     _logger.info("python=%s", sys.version.split()[0])
     _logger.info("log_level=%s", _log_level_name)
     _logger.info("project_root=%s", config.project_root)
+    _logger.info("data_anchor=%s", config.data_anchor)
     _logger.info("data_dir=%s writable=%s", data_dir, writable)
     _logger.info("frontend_dist=%s exists=%s", _FRONTEND_DIST, _FRONTEND_DIST.is_dir())
     _logger.info("packages: %s", ", ".join(versions))
@@ -90,6 +145,7 @@ async def _lifespan(app: FastAPI):
         config.concurrency.requests_per_minute,
         config.concurrency.tokens_per_minute,
     )
+    _log_system_stats()
     if not writable:
         _logger.error("data_dir %s is NOT writable - uploads/extraction will fail", data_dir)
 
@@ -119,7 +175,7 @@ async def health_route():
 
 
 def _save_upload(file: UploadFile) -> Path:
-    staging_dir = config.project_root / "data" / "uploads"
+    staging_dir = config.data_anchor / "data" / "uploads"
     staging_dir.mkdir(parents=True, exist_ok=True)
     dest = staging_dir / file.filename
     with open(dest, "wb") as f:

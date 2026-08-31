@@ -223,15 +223,16 @@ service.** It serves The Hindu's verbatim text and PDF pages - see "A note
 on content and licensing" above - so every deployment of it needs to sit
 behind a login, not a bare public IP.
 
-Current deployment target: a single GCP `e2-micro` VM (Debian 12,
-Always Free tier), no Docker - see `deploy/` (systemd unit, nginx site
-config with mandatory HTTP Basic auth, a first-time `setup.sh`, and an
-idempotent `deploy.sh` you run from your laptop for every update) and
-design/DESIGN.md "Deployment: GCP e2-micro VM" for the full reasoning
-(why the frontend is built locally and shipped prebuilt rather than built
-on the VM, why concurrency is turned down, the cache-header/egress
-budget, and the ownership model behind root owning the code/venv while
-only `data/` belongs to the service's own user).
+Current deployment target: a single GCP `e2-micro` VM (Debian 12, Always
+Free tier), no Docker - see `deploy/` (systemd unit for uvicorn, a Caddy
+config with automatic TLS and mandatory HTTP Basic auth on every route, a
+first-time `setup.sh`, an idempotent `deploy.sh` you run from your laptop
+for every update, and a daily pruning timer) and design/DESIGN.md
+"Deployment: GCP e2-micro VM" for the full reasoning (why the frontend is
+built locally and shipped prebuilt rather than built on the VM, why
+`hindu_extract` is imported via `PYTHONPATH` rather than pip-installed,
+why concurrency is turned down, the ownership model, and the disk
+retention policy below).
 
 A `Dockerfile` also still exists at the repo root (originally built for
 Hugging Face Spaces, before HF discontinued free Docker Space hosting) -
@@ -239,13 +240,15 @@ it's a correct, self-contained way to run the app anywhere Docker *is*
 available, kept as an alternative rather than deleted, but it is not what
 the currently-deployed instance runs on.
 
-**Data is ephemeral by design.** There's no external store configured;
-everything under `data/` (bronze/gold/cache/trace) lives on the machine's
-own disk. A full 18-page edition costs one extraction run (well under the
-500 requests/day Gemini quota) and takes well under two minutes, so
-re-uploading after a VM restart is an accepted tradeoff, not a bug - the
-Dashboard's empty-editions state is what a freshly (re)started instance
-shows.
+**Data persists across deploys and restarts, but is pruned after a
+retention window.** Extracted editions live at `/var/lib/pressdigest/data`
+- a separate path from the application code, never touched by `deploy.sh`
+- so a routine code update can never wipe an already-extracted edition
+and a VM restart doesn't lose anything either. What does eventually
+reclaim space is `deploy/prune_editions.py`, run daily: any edition (and
+independently, any Gemini/Phase-1 cache entry) untouched for more than 30
+days (configurable) is deleted, since the 30GB disk isn't unlimited and
+uploaded e-paper PDFs run 10-40MB each.
 
 ## Configuration
 
@@ -261,6 +264,11 @@ file - see design/DESIGN.md "Deployment: GCP e2-micro VM" for why):
 - `HINDU_EXTRACT_MAX_CONCURRENT` - overrides `concurrency.max_concurrent`
   (the e2-micro deployment sets this to 2, down from the default 4, as a
   safety margin against its shared-core CPU).
+- `HINDU_EXTRACT_DATA_ROOT` - overrides where every `paths.*` value in
+  `config/default.yaml` resolves relative to (default: the project root,
+  same as always). The e2-micro deployment sets this to
+  `/var/lib/pressdigest`, putting all pipeline output on a separate path
+  from the application code without renaming a single key in the YAML.
 - `LOG_LEVEL` - the API process's log level (`INFO` by default).
 
 ## Tests
