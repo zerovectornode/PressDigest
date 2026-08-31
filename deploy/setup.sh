@@ -3,8 +3,20 @@
 # safe to re-run (every step checks before acting) if you need to repair
 # something rather than rebuild the VM from scratch.
 #
+# REQUIRED ORDER: push to main, wait for the "Build and publish deploy
+# branch" GitHub Action to finish (Actions tab on the repo - it creates
+# the `deploy` branch this script clones below, which does not exist on a
+# repo that has never had that workflow run), *then* run this script.
+# Running it before that workflow has ever completed fails at the clone
+# step below with a clear message instead of a raw git error, precisely
+# because that ordering is easy to get backwards on a first-time setup.
+#
 # Fetched standalone (curl, not scp/clone-the-whole-repo - there is no
-# laptop in this design at all, only Cloud Shell / browser SSH):
+# laptop in this design at all, only Cloud Shell / browser SSH). This
+# fetches from `main`, not `deploy` - main always exists (it's the
+# default branch), so there's no ordering problem for this specific URL,
+# only for the `deploy`-branch clone this script does internally further
+# down:
 #
 #   curl -fsSL https://raw.githubusercontent.com/zerovectornode/PressDigest/main/deploy/setup.sh -o setup.sh
 #   sudo bash setup.sh
@@ -102,6 +114,24 @@ echo "==> directories"
 # reason about the way the earlier rsync-based design needed.
 mkdir -p /opt/pressdigest /var/lib/pressdigest/data
 chown pressdigest:pressdigest /opt/pressdigest /var/lib/pressdigest/data
+
+echo "==> checking the deploy branch exists"
+# Fails here, loudly and specifically, rather than a few lines further
+# down as a raw `git clone` error - this is exactly the mistake the
+# REQUIRED ORDER note at the top of this file exists to prevent: running
+# this script before the "Build and publish deploy branch" GitHub Action
+# has ever completed once, which is the only thing that creates the
+# `deploy` branch in the first place. `git ls-remote --exit-code` is a
+# read-only check against the remote, safe to run before committing to
+# anything.
+if ! git ls-remote --exit-code --heads "$REPO_URL" deploy > /dev/null 2>&1; then
+  echo "!!! The 'deploy' branch does not exist yet on $REPO_URL" >&2
+  echo "!!! This means the 'Build and publish deploy branch' GitHub Action" >&2
+  echo "!!! has never completed successfully - check the Actions tab on the" >&2
+  echo "!!! repo, push to main if you haven't yet, and wait for that workflow" >&2
+  echo "!!! to finish (it creates this branch). Then re-run this script." >&2
+  exit 1
+fi
 
 echo "==> cloning the deploy branch"
 # The `deploy` branch is a GitHub Actions build artifact (one commit,

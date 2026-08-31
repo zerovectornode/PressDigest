@@ -242,6 +242,13 @@ it's a correct, self-contained way to run the app anywhere Docker *is*
 available, kept as an alternative rather than deleted, but it is not what
 the currently-deployed instance runs on.
 
+**First-time setup order matters**: push to `main`, wait for the "Build
+and publish deploy branch" GitHub Action to finish at least once (Actions
+tab on the repo), *then* run `setup.sh` on the VM. That workflow is what
+creates the `deploy` branch `setup.sh` clones - running it first against
+a repo that has never had the workflow run fails with a clear message
+telling you to do exactly this, rather than a raw git error.
+
 **Data persists across deploys and restarts, but is pruned after a
 retention window.** Extracted editions live at `/var/lib/pressdigest/data`
 - a separate path from the application code, never touched by `update.sh`
