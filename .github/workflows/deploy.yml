@@ -1,0 +1,79 @@
+name: Build and publish deploy branch
+
+# Runs on every push to main - the VM never builds anything itself (its
+# 1GB RAM would OOM on npm run build's toolchain - see design/DESIGN.md
+# "Deployment: GCP e2-micro VM"), and there is no laptop in this loop
+# either. This is the only place the frontend gets built now.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build frontend
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+
+      - name: Assemble deploy staging directory
+        run: |
+          mkdir -p /tmp/deploy-stage
+          # Plain rsync, not git - .gitignore is irrelevant here (this
+          # copies whatever's actually on disk, so frontend/dist, built
+          # above and gitignored on main, comes along like everything
+          # else). .gitignore itself is excluded on purpose: the staging
+          # dir becomes a *fresh* git repo below, and if main's
+          # .gitignore came along too, `git add -A` there would silently
+          # re-exclude frontend/dist right back out.
+          rsync -a \
+            --exclude '.git' --exclude '.github' --exclude '.gitignore' --exclude '.gitattributes' \
+            --exclude 'data' \
+            --exclude 'docs' \
+            --exclude '.env' --exclude '.env.*' \
+            --exclude 'tests' \
+            --exclude '__pycache__' --exclude '*.pyc' --exclude '.pytest_cache' \
+            --exclude '.claude' \
+            --exclude 'frontend/node_modules' \
+            --exclude 'frontend/src' --exclude 'frontend/public' \
+            --exclude 'frontend/*.json' --exclude 'frontend/*.ts' --exclude 'frontend/*.html' \
+            ./ /tmp/deploy-stage/
+
+      - name: Publish to deploy branch (orphan, force-pushed)
+        # A fresh `git init` + single commit each run, not an
+        # `actions/checkout` of the existing `deploy` branch plus more
+        # commits on top - the VM only ever reads the LATEST commit on
+        # this branch (git reset --hard, see update.sh), so there is no
+        # value in keeping history here, only cost: frontend/dist alone
+        # (the PDF.js worker is ~2MB) would make an ever-growing branch
+        # balloon in size on every single push to main, forever. One
+        # commit, force-pushed, keeps the branch's clone/fetch size
+        # constant regardless of how many times this workflow has run.
+        run: |
+          cd /tmp/deploy-stage
+          git init -q
+          git checkout -q -b deploy
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -q -m "deploy: ${GITHUB_SHA}"
+          git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git push -q --force origin deploy:deploy
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

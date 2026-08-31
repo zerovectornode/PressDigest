@@ -3,13 +3,24 @@
 # safe to re-run (every step checks before acting) if you need to repair
 # something rather than rebuild the VM from scratch.
 #
-# Run on the VM as root: sudo bash setup.sh
+# Fetched standalone (curl, not scp/clone-the-whole-repo - there is no
+# laptop in this design at all, only Cloud Shell / browser SSH):
+#
+#   curl -fsSL https://raw.githubusercontent.com/zerovectornode/PressDigest/main/deploy/setup.sh -o setup.sh
+#   sudo bash setup.sh
+#
+# Because of that, this script cannot reference sibling deploy/ files the
+# way a normal checkout could - it clones the `deploy` branch itself
+# (step below) and references everything else from that clone afterward.
 set -euo pipefail
 
 if [ "$(id -u)" -ne 0 ]; then
   echo "run as root (sudo bash setup.sh)" >&2
   exit 1
 fi
+
+REPO_URL="https://github.com/zerovectornode/PressDigest.git"
+APP_DIR=/opt/pressdigest/app
 
 echo "==> apt packages"
 # Deliberately generous, not minimal - there is no local copy of this VM
@@ -29,7 +40,9 @@ echo "==> apt packages"
 #   - libxml2, libxslt1.1: some PDFs route text/font metadata through
 #     XML-based structures (XMP metadata, some font programs); pdfminer.six
 #     doesn't hard-require these, but they're cheap insurance too.
-#   - rsync: what deploy.sh uses to ship code from the laptop.
+#   - git: how this VM gets and updates the app now - see update.sh.
+#     Frontend building happens entirely in GitHub Actions (1GB RAM here
+#     would OOM on npm run build), so no Node/npm is installed at all.
 #   - curl, gnupg, debian-keyring, debian-archive-keyring,
 #     apt-transport-https: needed to add Caddy's official apt repo below
 #     (per caddyserver.com/docs/install#debian-ubuntu-raspbian).
@@ -38,7 +51,7 @@ apt-get install -y --no-install-recommends \
     python3-venv python3-pip python3-dev build-essential \
     libjpeg62-turbo libpng16-16 zlib1g libtiff6 libfreetype6 liblcms2-2 libopenjp2-7 libwebp7 \
     libxml2 libxslt1.1 \
-    rsync curl gnupg debian-keyring debian-archive-keyring apt-transport-https
+    git curl gnupg debian-keyring debian-archive-keyring apt-transport-https
 
 echo "==> swapfile (1GB RAM is tight - pip installing pdfplumber's tree, and"
 echo "    extraction itself, both assume 2GB swap is active)"
@@ -78,32 +91,47 @@ fi
 
 echo "==> directories"
 # App code + venv and the actual data live on separate trees on purpose:
-# deploy.sh's rsync only ever touches /opt/pressdigest/app, so
-# /var/lib/pressdigest/data - extracted editions, the only copy of what a
-# Gemini call returned - can never be wiped by a routine redeploy.
+# update.sh's `git reset --hard` only ever touches /opt/pressdigest/app,
+# so /var/lib/pressdigest/data - extracted editions, the only copy of
+# what a Gemini call returned - can never be wiped by a routine update.
 #
-# Ownership: pressdigest owns everything initially (this chown). After
-# the first deploy.sh run, /opt/pressdigest/app becomes root-owned
-# instead - deploy.sh's rsync runs as root over SSH (the connecting
-# account isn't the pressdigest user, so it needs root to write into a
-# directory it doesn't own) - which is fine, since pressdigest.service
-# only ever READS app/ (importing over PYTHONPATH, never writing back
-# into the source tree the way an editable pip install would - see
-# requirements.txt). /opt/pressdigest/venv and /var/lib/pressdigest stay
-# pressdigest-owned indefinitely: deploy.sh's pip step runs as that user
-# explicitly, and this rsync never touches /var/lib/pressdigest at all.
-mkdir -p /opt/pressdigest/app
-mkdir -p /var/lib/pressdigest/data
-chown -R pressdigest:pressdigest /opt/pressdigest /var/lib/pressdigest
+# Both trees stay owned by the pressdigest user indefinitely: with no
+# laptop and no rsync-over-SSH-as-root in this design at all, every git/
+# pip operation below and in update.sh runs as `sudo -u pressdigest`
+# consistently, so there's no root-vs-service-user ownership split to
+# reason about the way the earlier rsync-based design needed.
+mkdir -p /opt/pressdigest /var/lib/pressdigest/data
+chown pressdigest:pressdigest /opt/pressdigest /var/lib/pressdigest/data
+
+echo "==> cloning the deploy branch"
+# The `deploy` branch is a GitHub Actions build artifact (one commit,
+# force-pushed on every push to main - see .github/workflows/deploy.yml):
+# frontend/dist/ already built, everything else the VM needs, nothing it
+# doesn't (no tests/, no data/, no frontend source or node_modules).
+# --single-branch only (not --depth 1): every push replaces the branch
+# with a brand-new, unrelated root commit (not a new commit built on the
+# previous one - see the workflow), so a shallow clone would be fighting
+# a moving, disconnected shallow boundary on every single update.py's
+# `git fetch` for no actual size benefit - a single-commit branch has no
+# history to shallow-clone away from in the first place.
+if [ ! -d "$APP_DIR/.git" ]; then
+  sudo -u pressdigest git clone --branch deploy --single-branch "$REPO_URL" "$APP_DIR"
+else
+  echo "$APP_DIR already a git checkout, skipping clone (use update.sh to refresh it)"
+fi
 
 if [ ! -f /opt/pressdigest/venv/bin/python ]; then
   sudo -u pressdigest python3 -m venv /opt/pressdigest/venv
 fi
 
+echo "==> installing Python dependencies"
+sudo -u pressdigest /opt/pressdigest/venv/bin/pip install --no-cache-dir -r "$APP_DIR/deploy/requirements.txt"
+sha256sum "$APP_DIR/deploy/requirements.txt" | awk '{print $1}' | sudo -u pressdigest tee /opt/pressdigest/.requirements.sha256 > /dev/null
+
 echo "==> app secrets"
 mkdir -p /etc/pressdigest
 if [ ! -f /etc/pressdigest/env ]; then
-  cp "$(dirname "$0")/env.example" /etc/pressdigest/env
+  cp "$APP_DIR/deploy/env.example" /etc/pressdigest/env
   echo "wrote /etc/pressdigest/env - edit it now and set GEMINI_API_KEY"
 fi
 chown root:root /etc/pressdigest/env
@@ -111,18 +139,18 @@ chmod 600 /etc/pressdigest/env
 
 echo "==> caddy environment (site address, basic auth)"
 if [ ! -f /etc/pressdigest/caddy.env ]; then
-  cp "$(dirname "$0")/caddy.env.example" /etc/pressdigest/caddy.env
+  cp "$APP_DIR/deploy/caddy.env.example" /etc/pressdigest/caddy.env
   echo "wrote /etc/pressdigest/caddy.env - edit it now (BASIC_AUTH_USER/HASH at minimum)"
 fi
 chown root:caddy /etc/pressdigest/caddy.env 2>/dev/null || chown root:root /etc/pressdigest/caddy.env
 chmod 640 /etc/pressdigest/caddy.env
 
 echo "==> systemd: pressdigest.service"
-cp "$(dirname "$0")/pressdigest.service" /etc/systemd/system/pressdigest.service
+cp "$APP_DIR/deploy/pressdigest.service" /etc/systemd/system/pressdigest.service
 
 echo "==> systemd: pruning timer"
-cp "$(dirname "$0")/pressdigest-prune.service" /etc/systemd/system/pressdigest-prune.service
-cp "$(dirname "$0")/pressdigest-prune.timer" /etc/systemd/system/pressdigest-prune.timer
+cp "$APP_DIR/deploy/pressdigest-prune.service" /etc/systemd/system/pressdigest-prune.service
+cp "$APP_DIR/deploy/pressdigest-prune.timer" /etc/systemd/system/pressdigest-prune.timer
 
 echo "==> systemd: caddy drop-in (reads /etc/pressdigest/caddy.env)"
 mkdir -p /etc/systemd/system/caddy.service.d
@@ -132,7 +160,7 @@ EnvironmentFile=/etc/pressdigest/caddy.env
 EOF
 
 echo "==> caddy config"
-cp "$(dirname "$0")/Caddyfile" /etc/caddy/Caddyfile
+cp "$APP_DIR/deploy/Caddyfile" /etc/caddy/Caddyfile
 
 systemctl daemon-reload
 systemctl enable pressdigest
@@ -145,6 +173,8 @@ echo "==> Setup script done. Remaining manual steps:"
 echo "  1. Edit /etc/pressdigest/env and set GEMINI_API_KEY"
 echo "  2. Generate a basic-auth hash: caddy hash-password --plaintext '<password>'"
 echo "     Put the username and that hash into /etc/pressdigest/caddy.env"
-echo "  3. From your laptop, run deploy/deploy.sh <user>@<this-vm> to ship the app"
+echo "  3. systemctl start pressdigest"
 echo "  4. systemctl restart caddy"
 echo "  5. systemctl status pressdigest caddy --no-pager -l"
+echo
+echo "For every update after this: sudo bash $APP_DIR/deploy/update.sh"

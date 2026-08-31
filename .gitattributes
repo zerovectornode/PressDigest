@@ -1,7 +1,10 @@
-# deploy/ is rsynced verbatim to a Linux VM (see deploy/deploy.sh) - a
-# CRLF line ending on the #!/usr/bin/env bash shebang line breaks the
-# interpreter lookup outright on Linux. Force LF regardless of the
-# committing machine's core.autocrlf (this repo has been developed on
-# Windows, where autocrlf=true would otherwise reintroduce CRLF on
-# checkout).
+# deploy/ is git-cloned/pulled verbatim onto a Linux VM (see
+# deploy/setup.sh, deploy/update.sh) - a CRLF line ending on the
+# #!/usr/bin/env bash shebang line breaks the interpreter lookup outright
+# on Linux. .github/ is included too since its shell steps (see
+# .github/workflows/deploy.yml) run on GitHub's own Linux runners, same
+# risk. Force LF regardless of the committing machine's core.autocrlf
+# (this repo has been developed on Windows, where autocrlf=true would
+# otherwise reintroduce CRLF on checkout).
 deploy/* text eol=lf
+.github/**/*.yml text eol=lf

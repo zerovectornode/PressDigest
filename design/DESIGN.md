@@ -1199,15 +1199,42 @@ longer what's actually deployed.
 ## Deployment: GCP e2-micro VM
 
 No Docker (a constraint of the deploying machine, not a technical
-requirement - the app has none of its own), and no local way to test any
-of this before it runs on the real VM either, the same situation as the
-HF attempt above. Bare VM (project `free-tier-sandbox-507212`, zone
-`us-central1-a`, Debian 12, 1GB RAM, 30GB pd-standard, 2GB swap): systemd
-runs uvicorn directly, **Caddy** reverse-proxies and terminates Basic Auth
-+ TLS in front of it. Every file lives under `deploy/`
-(`pressdigest.service`, `Caddyfile`, `setup.sh`, `deploy.sh`,
-`requirements.txt`, `env.example`, `caddy.env.example`,
-`prune_editions.py`, `pressdigest-prune.service`/`.timer`).
+requirement - the app has none of its own), no laptop anywhere in the
+loop either (all VM interaction is Cloud Shell / browser SSH), and no
+local way to test any of this before it runs on the real VM, the same
+situation as the HF attempt above. Bare VM (project
+`free-tier-sandbox-507212`, zone `us-central1-a`, Debian 12, 1GB RAM,
+30GB pd-standard, 2GB swap): systemd runs uvicorn directly, **Caddy**
+reverse-proxies and terminates Basic Auth + TLS in front of it. Every
+file lives under `deploy/` (`pressdigest.service`, `Caddyfile`,
+`setup.sh`, `update.sh`, `requirements.txt`, `env.example`,
+`caddy.env.example`, `prune_editions.py`,
+`pressdigest-prune.service`/`.timer`) plus
+`.github/workflows/deploy.yml`.
+
+**No laptop build step, because there's no laptop at all** - a real
+constraint discovered only after the first version of this deployment
+was built (see the superseded nginx-based commit's `deploy.sh`, which
+assumed one, kept as honest history rather than rewritten). GitHub
+Actions now does what the laptop used to: on every push to `main`, it
+runs `npm run build` and publishes the built `frontend/dist/` plus
+everything else the VM needs to a `deploy` branch. The VM never builds
+anything and has no Node/npm installed at all - it only ever `git
+fetch`/`reset --hard`s to that branch (see `update.sh` below).
+
+**The `deploy` branch is a single, force-pushed orphan commit, never a
+growing history.** Each workflow run does a fresh `git init` in a staging
+directory (not `actions/checkout` of the existing `deploy` branch plus a
+new commit on top) and force-pushes that as the entire branch. Considered
+and rejected: a regular branch that just keeps committing on top for
+every push to `main`. The branch's only consumer is `update.sh`'s `git
+reset --hard origin/deploy`, which only ever cares about the latest
+commit - keeping history there is pure cost with no offsetting value,
+and the cost is real: `frontend/dist/` includes a ~2MB PDF.js worker
+bundle alone, which an ever-growing branch would re-commit in full on
+every single push to `main`, forever inflating clone/fetch size on a
+VM with a 30GB disk to manage carefully. One commit keeps that size
+constant regardless of how many times the workflow has run.
 
 **Caddy, not nginx+certbot** - fewer moving parts on a machine with no
 local way to debug a misconfiguration. One short `Caddyfile` gets
@@ -1249,29 +1276,30 @@ earlier HF/nginx design. An editable install writes an `egg-info`
 directory back into the source tree, which needs the installing identity
 to have write access there; `pressdigest.service` instead sets
 `Environment=PYTHONPATH=/opt/pressdigest/app/src` and imports
-`hindu_extract` straight from the rsynced source, no install step for the
-app itself at all. `deploy/requirements.txt` covers only third-party
+`hindu_extract` straight from the git-cloned source, no install step for
+the app itself at all. `deploy/requirements.txt` covers only third-party
 dependencies, installed into the venv with `pip install --no-cache-dir`
 (saves disk and the transient RAM `pip`'s wheel cache would otherwise
-use) - and only when the file's hash has changed since the last deploy,
+use) - and only when the file's hash has changed since the last update,
 so a routine code-only update doesn't re-run pip at all.
 
-**Ownership follows from that.** `/opt/pressdigest` (app code + venv) and
-`/var/lib/pressdigest` (data) both start out owned by the `pressdigest`
-service user (`setup.sh`). After the first `deploy.sh` run,
-`/opt/pressdigest/app` becomes root-owned instead - the rsync runs as
-root over SSH (`--rsync-path="sudo rsync"`) because the SSH-connecting
-account (your own gcloud/OS Login identity) isn't `pressdigest` and has
-no other way to write into a directory it doesn't own. That's fine:
-`pressdigest.service` only ever *reads* `app/` (the PYTHONPATH import,
-never a write-back), and root-owned files are readable by default. The
-venv stays `pressdigest`-owned throughout, since `deploy.sh`'s pip step
-explicitly runs as `sudo -u pressdigest`. `/var/lib/pressdigest/data` is
-untouched by `deploy.sh` at all - it isn't on any path that script
-mentions - so a redeploy can never wipe an already-extracted edition.
-Systemd's own hardening (`ProtectSystem=strict`,
-`ReadWritePaths=/var/lib/pressdigest`) is the actual write-access
-enforcement on top of all of this, not the Unix ownership alone.
+**Ownership is uniform, unlike the earlier rsync-based design.**
+`/opt/pressdigest` (app code + venv) and `/var/lib/pressdigest` (data)
+are both owned by the `pressdigest` service user, indefinitely - not just
+initially. The earlier design (still visible in the superseded nginx
+commit's `deploy.sh`) needed a root-vs-service-user split specifically
+because a *laptop's* SSH identity had to write into a directory it didn't
+own; with no laptop and no rsync-over-SSH at all now, every git/pip
+operation in `setup.sh` and `update.sh` runs as `sudo -u pressdigest`
+uniformly, so there's no ownership conflict to design around in the first
+place. `git reset --hard`, not `merge` or `pull` (`update.sh`) - the
+`deploy` branch is CI-generated and force-pushed as an unrelated commit
+every time (see above), so there is never a merge to reason about, only
+"move to whatever's there now." `/var/lib/pressdigest/data` is on a
+completely separate path `update.sh` never mentions, so a routine update
+can never wipe an already-extracted edition - reinforced, not just
+implied, by systemd's own `ProtectSystem=strict` +
+`ReadWritePaths=/var/lib/pressdigest`.
 
 **Data root is env-overridable, not hardcoded, and doesn't touch a single
 path string in config/default.yaml.** `config.py` gained a `data_anchor`
@@ -1361,3 +1389,31 @@ the full Pillow image-format library set, `libxml2`/`libxslt1.1`, and a
 compiler toolchain anyway, on the reasoning that the cost (a few hundred
 MB of disk, once) is negligible next to the cost of a crash that only
 reproduces on one specific PDF's font subset in front of a real user.
+
+**Peak memory: read the cgroup directly, not `watch free -h`.** A polling
+loop in a second SSH session misses spikes between polls and, on a
+1GB-RAM box, the polling session's own memory footprint is itself a
+confound. `pressdigest.service` sets `MemoryAccounting=yes`, and the
+reliable read afterward is the kernel's own accounting, not a systemd CLI
+feature: `cat /sys/fs/cgroup/system.slice/pressdigest.service/memory.peak`.
+Deliberately not `systemctl show -p MemoryPeak` as the primary method -
+that property is a newer systemd addition than what Debian 12's shipped
+systemd version is confirmed to have, and the cgroup v2 file underneath
+it works regardless, with no version uncertainty to reason about on a
+machine with no local systemd version to check it against first.
+
+**The upload path was checked end to end for any local-filesystem
+assumption, since a PDF only ever arrives via a browser file picker on
+this deployment.** Traced the whole chain: the frontend's file input
+(`Dashboard.tsx`, both the `<input type="file">` and drag-and-drop paths)
+sends the file as `multipart/form-data` via the browser's own `File`/
+`FormData` APIs - nothing about a client-side path is ever referenced,
+by construction, since browsers don't expose one. Server-side,
+`main.py`'s `_save_upload` writes the received bytes to
+`config.data_anchor / "data" / "uploads"` (already fixed to route through
+`data_anchor`, so this lands under `/var/lib/pressdigest` on this
+deployment, not wherever `project_root` happens to be), and
+`jobs.start_extraction_job` takes that server-side path from there -
+nothing downstream ever touches a path that could only exist on whoever's
+machine is running the browser. No change was needed; this was
+verification, not a fix.

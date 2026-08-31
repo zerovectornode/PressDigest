@@ -224,15 +224,17 @@ on content and licensing" above - so every deployment of it needs to sit
 behind a login, not a bare public IP.
 
 Current deployment target: a single GCP `e2-micro` VM (Debian 12, Always
-Free tier), no Docker - see `deploy/` (systemd unit for uvicorn, a Caddy
-config with automatic TLS and mandatory HTTP Basic auth on every route, a
-first-time `setup.sh`, an idempotent `deploy.sh` you run from your laptop
-for every update, and a daily pruning timer) and design/DESIGN.md
-"Deployment: GCP e2-micro VM" for the full reasoning (why the frontend is
-built locally and shipped prebuilt rather than built on the VM, why
-`hindu_extract` is imported via `PYTHONPATH` rather than pip-installed,
-why concurrency is turned down, the ownership model, and the disk
-retention policy below).
+Free tier), no Docker, no laptop in the loop at all - see `deploy/`
+(systemd unit for uvicorn, a Caddy config with automatic TLS and
+mandatory HTTP Basic auth on every route, a first-time `setup.sh`, an
+idempotent `update.sh` you run on the VM itself for every update, and a
+daily pruning timer), `.github/workflows/deploy.yml` (builds the frontend
+and publishes everything the VM needs to a `deploy` branch on every push
+to `main`), and design/DESIGN.md "Deployment: GCP e2-micro VM" for the
+full reasoning (why the frontend is built in CI rather than on the VM or
+a laptop, why `hindu_extract` is imported via `PYTHONPATH` rather than
+pip-installed, why concurrency is turned down, the ownership model, and
+the disk retention policy below).
 
 A `Dockerfile` also still exists at the repo root (originally built for
 Hugging Face Spaces, before HF discontinued free Docker Space hosting) -
@@ -242,7 +244,7 @@ the currently-deployed instance runs on.
 
 **Data persists across deploys and restarts, but is pruned after a
 retention window.** Extracted editions live at `/var/lib/pressdigest/data`
-- a separate path from the application code, never touched by `deploy.sh`
+- a separate path from the application code, never touched by `update.sh`
 - so a routine code update can never wipe an already-extracted edition
 and a VM restart doesn't lose anything either. What does eventually
 reclaim space is `deploy/prune_editions.py`, run daily: any edition (and
