@@ -4,6 +4,13 @@ import { formatTimestamp, runType } from '../../lib/format'
 import { useRun, useRunPageRaw, useRunPagesStages } from '../../lib/queries'
 import type { StageEventOut } from '../../types/api'
 
+// Matches trace.py's STAGE_NAMES for the per-page stages (ranking is
+// edition-wide, handled separately - see isRankingRun below). No
+// 'render' entry: the vision-image render this used to show was removed
+// as dead code (nothing ever read it back - see design/DESIGN.md
+// "Removed: the unused vision-image render"), and the backend hasn't
+// emitted that stage since, so a 'render' column here would only ever
+// render empty - misleading, not just unused.
 const STAGE_ORDER = [
   'char_extraction',
   'line_building',
@@ -11,7 +18,6 @@ const STAGE_ORDER = [
   'gemini_call',
   'validation',
   'assembly',
-  'render',
 ] as const
 
 const STAGE_COLOR: Record<string, string> = {
@@ -21,7 +27,6 @@ const STAGE_COLOR: Record<string, string> = {
   gemini_call: 'bg-amber-500',
   validation: 'bg-teal-500',
   assembly: 'bg-cyan-500',
-  render: 'bg-fuchsia-400',
 }
 
 type Tab = 'timeline' | 'tokens' | 'validation' | 'raw'
