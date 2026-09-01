@@ -1417,3 +1417,42 @@ deployment, not wherever `project_root` happens to be), and
 nothing downstream ever touches a path that could only exist on whoever's
 machine is running the browser. No change was needed; this was
 verification, not a fix.
+
+**A real incident: the "lazy per-page parsing" verification above was
+correct but incomplete** - it confirmed nothing is computed before it's
+needed, but never checked whether an already-computed page's data is
+released afterward. Live on the deployed VM: the first real 18-page
+extraction pushed `pressdigest.service` to ~700MB resident (cgroup
+`memory.current`) on the 969MB box, 1GB of the 2GB swapfile in active
+use, load average ~2.0 on a 0.25-vCPU sustained baseline, and the service
+unresponsive for a 38-minute stretch with zero log output - not a slow
+extraction, a thrashing one.
+
+Root cause, confirmed against pdfplumber's own source and its README
+(not guessed): `pdf.pages` returns one persistent list of `Page` objects
+that lives for the entire `with pdfplumber.open(...) as pdf:` block -
+which in `extract_pages` spans the whole loop over all `page_nums`, not
+one page at a time. Each `Page` caches its decompressed
+`_objects`/`_layout` (character/positioning data) as plain instance
+attributes with no eviction, ever, once computed. So while page N+1's
+data genuinely isn't computed before page N+1 is reached (the earlier
+verification's claim, still true), page N's data is never released once
+you move past it - by page 18, all 18 pages' decompressed content is
+simultaneously resident. pdfplumber's own README documents this exact
+scenario (large PDFs, many pages, memory growing) and its fix:
+`Page.close()`, called once you're done with a page, flushes
+`_objects`/`_layout`/`_edges` and the separately-`lru_cache`d
+`get_textmap()`. Added to `pipeline.py`'s `_process_one_page`,
+immediately after `build_page`/`check_page` both finish with a page (both
+already return plain dataclasses with no live reference back into the
+page's raw char data, so there's nothing left downstream that needs it
+open) - bounding memory to roughly one page's decompressed data at a
+time instead of the whole edition's.
+
+Considered and deliberately not done yet: a hard `MemoryMax=` on
+`pressdigest.service` to fail a single request rather than let the whole
+VM thrash again if something else turns out to leak. Not set blind -
+there's no measured baseline yet for what "normal" resident memory looks
+like *after* this fix, and guessing a number risks the opposite failure
+mode (killing a legitimate extraction under normal load). Revisit once
+`_log_system_stats`/`memory.peak` have a few real data points post-fix.

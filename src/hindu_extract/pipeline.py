@@ -76,6 +76,23 @@ def _process_one_page(
             detail["finding_count"] = len(findings)
             detail["findings"] = [f.to_dict() for f in findings]
 
+    # `pdf.pages` is a persistent list that lives for this whole loop's
+    # `with pdfplumber.open(...)` block (see extract_pages below), not
+    # scoped to one page - pdfplumber caches each page's decompressed
+    # char/object/layout data on the Page object itself with no eviction,
+    # so without this, memory grows roughly linearly with page count
+    # across one edition (confirmed live: an 18-page extraction pushed
+    # this process to ~700MB resident on the 1GB e2-micro deployment,
+    # swapping heavily - see design/DESIGN.md "Deployment: GCP e2-micro
+    # VM"). page.close() is pdfplumber's own documented fix for exactly
+    # this - flushes _objects/_layout/_edges plus the separately-cached
+    # get_textmap() lru_cache - bounding memory to ~one page's worth of
+    # decompressed data at a time instead of all of them. Nothing after
+    # this point needs the page object again: build_page/check_page
+    # already ran, and their return values (Line/CanaryFinding
+    # dataclasses) hold plain data, not live references back into it.
+    page.close()
+
     page_result_dict = {
         "metadata": metadata.to_dict(),
         "lines": [line.to_dict() for line in lines],
