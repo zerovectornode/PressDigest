@@ -352,6 +352,40 @@ failure mode the gap check alone would not catch.
 during development). Any non-zero result should be treated as a real signal
 worth a human look, not routine noise.
 
+### Ligature canary: row-bucketed word lookup (perf fix)
+
+`_chars_in_word()` originally scanned every char on the page, once per word
+- O(words * chars) - to find the handful of chars belonging to that word.
+This dates back to the original Phase 1 commit (3c84226) that introduced
+canary.py, not the later word-space-gap fix (20377a2) - that commit only
+touched lines.py, which is O(n) per line and was never the culprit; it
+just happened to be the most recent change to this area, which is why it
+was the first suspect. Tolerable on this PDF's pages, but a second real
+edition (a fresh, denser page: 3,498 words * 21,285 chars = 74.4M comparisons) measured at 39.3s for
+that one page's word-matching alone, 91% of that page's entire canary time,
+and made a 16-page job take 537s instead of the expected ~2 minutes. The
+per-char (cid:N)/U+FFFD regex check was not the problem (18ms for the same
+21,285 chars) - it was specifically the per-word full-page rescan.
+
+Fix: bucket chars by a coarse row key (`top // 1.0`) once per page, then
+look up only the buckets a word's [top, bottom] band could plausibly touch
+- a superset of the true candidates, filtered by the exact same
+x0/x1/top/bottom predicate as before, so results are provably identical
+(verified: byte-identical finding counts old vs. new on all 16 pages of
+the real edition that exposed this, plus all existing canary/page
+regression tests still pass on the original 18-page PDF). Measured
+speedup on that edition's two extremes: a 7,128-char page went from 5.31s
+to 0.097s of canary time; the 21,285-char page went from 42.87s to 0.540s.
+
+Separately, note that a genuinely first-time (uncached) Phase 1 extraction
+costs roughly 12-15s/page on either PDF regardless of this fix - that's
+pdfplumber/pdfminer's own content-stream parsing cost, paid once per
+edition and then served from the bronze cache on every subsequent run. The
+89.7s/18-page baseline this regression was compared against was itself
+cache-warm from repeated testing, not a fair uncached comparison; it's
+mentioned here so a future "Phase 1 got slow again" investigation doesn't
+mistake this fixed cost for a new regression.
+
 ## Other structural findings from initial inspection
 
 - **ToUnicode CMaps are not universally absent.** Page 1 (and most pages)

@@ -39,11 +39,17 @@ Calibrated thresholds and their justification live in config/default.yaml.
 from __future__ import annotations
 
 import re
+from collections import defaultdict
 
 from hindu_extract.config import Config
 from hindu_extract.models import CanaryFinding
 
 _CID_PLACEHOLDER = re.compile(r"^\(cid:\d+\)$")
+
+# Row-bucketing granularity for _chars_in_word's candidate lookup (see
+# below) - small relative to any real font size, so it narrows the
+# candidate set without needing to be tuned per page.
+_ROW_BUCKET_HEIGHT = 1.0
 
 
 def _is_unmapped(text: str | None) -> bool:
@@ -54,11 +60,33 @@ def _is_unmapped(text: str | None) -> bool:
     return "�" in text
 
 
-def _chars_in_word(chars: list[dict], word: dict) -> list[dict]:
+def _bucket_chars_by_row(chars: list[dict]) -> dict[int, list[dict]]:
+    """Buckets chars by a coarse row key (top // _ROW_BUCKET_HEIGHT) so
+    _chars_in_word can look up only the handful of chars near a word's row
+    instead of scanning every char on the page for every word - see the
+    perf note on _chars_in_word for why this matters."""
+    buckets: dict[int, list[dict]] = defaultdict(list)
+    for c in chars:
+        buckets[int(c["top"] // _ROW_BUCKET_HEIGHT)].append(c)
+    return buckets
+
+
+def _chars_in_word(row_buckets: dict[int, list[dict]], word: dict) -> list[dict]:
+    """Was a full `for c in chars` scan per word - O(words * chars_on_page)
+    (measured: 3,498 words * 21,285 chars = 74.4M comparisons, 39s, on one
+    dense page of a real edition - see design/DESIGN.md "Ligature canary:
+    row-bucketed word lookup"). row_buckets narrows the candidate pool to
+    chars whose row could plausibly overlap this word's [top, bottom] band
+    (a superset of true matches - the same x0/x1/top/bottom filter below is
+    still applied unchanged, so results are identical), before the filter
+    that used to run against every char on the page."""
+    lo = int((word["top"] - 0.5) // _ROW_BUCKET_HEIGHT)
+    hi = int((word["bottom"] + 0.5) // _ROW_BUCKET_HEIGHT)
+    candidates = [c for key in range(lo, hi + 1) for c in row_buckets.get(key, ())]
     return sorted(
         (
             c
-            for c in chars
+            for c in candidates
             if c["text"] != " "
             and c["x0"] >= word["x0"] - 0.1
             and c["x1"] <= word["x1"] + 0.1
@@ -77,9 +105,10 @@ def check_page(page, page_num: int, modal_font_size: float, config: Config) -> l
 
     chars = page.chars
     words = page.extract_words(keep_blank_chars=False, use_text_flow=False)
+    row_buckets = _bucket_chars_by_row(chars)
 
     for word in words:
-        wchars = _chars_in_word(chars, word)
+        wchars = _chars_in_word(row_buckets, word)
         if len(wchars) < 2:
             continue
         if outlier_cutoff and any((c.get("size") or 0) >= outlier_cutoff for c in wchars):
