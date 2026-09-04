@@ -30,6 +30,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable
 
 STAGE_NAMES = (
     "char_extraction",
@@ -113,6 +114,14 @@ def new_run_id() -> str:
 class RunTracer:
     db_path: Path
     run_id: str
+    # Optional, additive: called with (page_num, stage_name) right before a
+    # stage begins - unlike the stage_events row written in stage()'s
+    # finally block (only known once a stage *finishes*), this is the only
+    # signal of a stage *starting*. Default None reproduces prior behavior
+    # exactly; the API's background job runner is the only current user
+    # (see jobs.py), for live per-page progress display. Never allowed to
+    # break extraction - exceptions from it are swallowed.
+    on_stage_start: Callable[[int, str], None] | None = None
     _start_time: float = field(default=0.0, repr=False)
 
     def start_run(self, edition: str, date: str, pdf_hash: str | None, page_count: int) -> None:
@@ -168,6 +177,11 @@ class RunTracer:
         failed page is fully visible in the trace, not silently missing."""
         if stage_name not in STAGE_NAMES:
             raise ValueError(f"unknown stage {stage_name!r} - must be one of {STAGE_NAMES}")
+        if self.on_stage_start is not None:
+            try:
+                self.on_stage_start(page_num, stage_name)
+            except Exception:  # noqa: BLE001 - UI plumbing must never break extraction
+                pass
         detail: dict = {}
         started_at = _now_iso()
         start = time.time()
@@ -211,6 +225,15 @@ def list_runs(db_path: Path) -> list[dict]:
 def get_run(db_path: Path, run_id: str) -> dict | None:
     conn = _get_connection(db_path)
     row = conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def get_latest_run_for_edition(db_path: Path, edition: str, date: str) -> dict | None:
+    conn = _get_connection(db_path)
+    row = conn.execute(
+        "SELECT * FROM runs WHERE edition = ? AND date = ? ORDER BY started_at DESC LIMIT 1",
+        (edition, date),
+    ).fetchone()
     return dict(row) if row else None
 
 

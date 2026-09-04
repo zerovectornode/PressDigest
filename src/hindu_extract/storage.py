@@ -26,6 +26,14 @@ def write_manifest(config: Config, edition: str, date: str, manifest: dict) -> P
     return manifest_path
 
 
+def read_manifest(config: Config, edition: str, date: str) -> dict | None:
+    manifest_path = bronze_edition_dir(config, edition, date) / "manifest.json"
+    if not manifest_path.exists():
+        return None
+    with open(manifest_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
 def read_page_json(config: Config, edition: str, date: str, page_num: int) -> dict:
     path = bronze_page_dir(config, edition, date, page_num) / "page.json"
     with open(path, "r", encoding="utf-8") as f:

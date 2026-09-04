@@ -9,6 +9,8 @@ from pydantic import BaseModel
 
 JobStatusValue = Literal["queued", "running", "done", "failed"]
 PagePhaseValue = Literal["pending", "extracting", "grouping", "done", "failed"]
+PageStatusValue = Literal["pending", "in_progress", "done", "failed"]
+RunStatusValue = Literal["running", "done", "failed"]
 
 
 class ParsedMetadataOut(BaseModel):
@@ -19,6 +21,7 @@ class ParsedMetadataOut(BaseModel):
 class PagePhaseOut(BaseModel):
     page_num: int
     status: PagePhaseValue
+    current_stage: str | None = None
     articles_found: int | None = None
     validation_ok: bool | None = None
     needs_review: bool | None = None
@@ -36,6 +39,8 @@ class JobStatusOut(BaseModel):
     per_page: list[PagePhaseOut]
     all_cached: bool
     error: str | None = None
+    elapsed_s: float
+    eta_s: float | None = None
 
 
 class StartJobOut(BaseModel):
@@ -50,11 +55,19 @@ class EditionSummaryOut(BaseModel):
     date: str
     page_count: int
     article_count: int
+    extracted_at: str | None = None
+    status: RunStatusValue | None = None
+
+
+class PageStatusOut(BaseModel):
+    page_num: int
+    status: PageStatusValue
 
 
 class EditionDetailOut(EditionSummaryOut):
     pages_with_articles: int
     pages_with_zero_articles: list[int]
+    pages: list[PageStatusOut]
 
 
 class ArticleOut(BaseModel):
@@ -85,17 +98,21 @@ class ArticleOut(BaseModel):
 
 class PageOut(BaseModel):
     page_num: int
-    width: float
-    height: float
-    line_count: int
+    status: PageStatusValue
+    width: float | None
+    height: float | None
+    line_count: int | None
     article_count: int
     validation_ok: bool
     coverage_ratio: float | None
 
 
-# --- Step D: pipeline monitoring ("Pipeline" view) --------------------------
+class PageArticlesOut(BaseModel):
+    status: PageStatusValue
+    articles: list[ArticleOut]
 
-RunStatusValue = Literal["running", "done", "failed"]
+
+# --- Step D: pipeline monitoring ("Pipeline" view) --------------------------
 
 
 class RunSummaryOut(BaseModel):

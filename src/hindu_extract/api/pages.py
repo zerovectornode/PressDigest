@@ -29,15 +29,17 @@ def _read_gold(config: Config, edition: str, date: str, page_num: int) -> dict |
 
 
 def get_page(config: Config, edition: str, date: str, page_num: int) -> PageOut | None:
+    """Called only once the caller (main.py) has confirmed via
+    editions.get_page_status that this page is "done" - gold is therefore
+    expected to exist. metadata is read for width/height/line_count."""
     metadata = _read_bronze_metadata(config, edition, date, page_num)
-    if metadata is None:
-        return None
     gold = _read_gold(config, edition, date, page_num)
     return PageOut(
         page_num=page_num,
-        width=metadata["width"],
-        height=metadata["height"],
-        line_count=metadata["line_count"],
+        status="done",
+        width=metadata["width"] if metadata else None,
+        height=metadata["height"] if metadata else None,
+        line_count=metadata["line_count"] if metadata else None,
         article_count=len(gold["articles"]) if gold else 0,
         validation_ok=gold["validation_ok"] if gold else False,
         coverage_ratio=gold["coverage"]["coverage_ratio"] if gold else None,

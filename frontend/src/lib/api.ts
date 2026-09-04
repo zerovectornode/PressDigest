@@ -1,8 +1,8 @@
 import type {
-  ArticleOut,
   EditionDetailOut,
   EditionSummaryOut,
   JobStatusOut,
+  PageArticlesOut,
   PageOut,
   PageRawOut,
   ParsedMetadataOut,
@@ -40,6 +40,10 @@ export function getJobStatus(jobId: string): Promise<JobStatusOut> {
   return request<JobStatusOut>(`/jobs/${jobId}`)
 }
 
+export function listActiveJobs(): Promise<JobStatusOut[]> {
+  return request<JobStatusOut[]>('/jobs/active')
+}
+
 export function listEditions(): Promise<EditionSummaryOut[]> {
   return request<EditionSummaryOut[]>('/editions')
 }
@@ -52,12 +56,20 @@ export function editionPdfUrl(editionId: string): string {
   return `/api/editions/${editionId}/pdf`
 }
 
+// Mirrors hindu_extract.api.edition_id.make_edition_id - the API never
+// returns an edition_id for a job in progress (StartJobOut only has
+// edition/date), so the Dashboard needs to build one itself to link to
+// the reader before the job finishes.
+export function makeEditionId(edition: string, date: string): string {
+  return `${edition}__${date}`
+}
+
 export function getPage(editionId: string, pageNum: number): Promise<PageOut> {
   return request<PageOut>(`/editions/${editionId}/pages/${pageNum}`)
 }
 
-export function getPageArticles(editionId: string, pageNum: number): Promise<ArticleOut[]> {
-  return request<ArticleOut[]>(`/editions/${editionId}/pages/${pageNum}/articles`)
+export function getPageArticles(editionId: string, pageNum: number): Promise<PageArticlesOut> {
+  return request<PageArticlesOut>(`/editions/${editionId}/pages/${pageNum}/articles`)
 }
 
 export function listRuns(): Promise<RunSummaryOut[]> {

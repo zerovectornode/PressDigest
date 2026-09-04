@@ -35,6 +35,13 @@ export function useEditions() {
   return useQuery({ queryKey: ['editions'], queryFn: api.listEditions })
 }
 
+/** Backs Dashboard reconnection: fires once on mount so a page reload
+ * mid-extraction picks the job back up instead of showing the empty
+ * upload UI as if nothing were running - see design/DESIGN.md. */
+export function useActiveJobs() {
+  return useQuery({ queryKey: ['active-jobs'], queryFn: api.listActiveJobs })
+}
+
 export function useEdition(editionId: string | undefined) {
   return useQuery({
     queryKey: ['edition', editionId],
@@ -43,12 +50,20 @@ export function useEdition(editionId: string | undefined) {
   })
 }
 
+const TERMINAL_PAGE_STATUSES = new Set(['done', 'failed'])
+
 export function usePage(editionId: string | undefined, pageNum: number | undefined) {
   return useQuery({
     queryKey: ['page', editionId, pageNum],
     queryFn: () => api.getPage(editionId!, pageNum!),
     enabled: editionId !== undefined && pageNum !== undefined,
     retry: false,
+    // Pending/in-progress pages poll so the "still extracting" placeholder
+    // upgrades itself once the page finishes, without a manual refresh.
+    refetchInterval: (query) => {
+      const status = query.state.data?.status
+      return status && TERMINAL_PAGE_STATUSES.has(status) ? false : 2000
+    },
   })
 }
 
@@ -58,6 +73,10 @@ export function usePageArticles(editionId: string | undefined, pageNum: number |
     queryFn: () => api.getPageArticles(editionId!, pageNum!),
     enabled: editionId !== undefined && pageNum !== undefined,
     retry: false,
+    refetchInterval: (query) => {
+      const status = query.state.data?.status
+      return status && TERMINAL_PAGE_STATUSES.has(status) ? false : 2000
+    },
   })
 }
 

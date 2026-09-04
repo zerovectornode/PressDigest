@@ -1,4 +1,3 @@
-import { useEffect, useRef, useState } from 'react'
 import type { JobStatusOut, PagePhaseOut } from '../types/api'
 
 function statusColor(status: PagePhaseOut['status']): string {
@@ -15,32 +14,15 @@ function statusColor(status: PagePhaseOut['status']): string {
   }
 }
 
-/** Live ETA from this job's own observed pace - no server timing data
- * needed, just a client-side start timestamp and the pages_done count the
- * job status already reports. avg-seconds-per-completed-page extrapolated
- * to the remaining pages, recomputed every tick so it tightens as more
- * pages actually finish - never a fabricated/static estimate. */
-function useEtaSeconds(job: JobStatusOut): number | null {
-  const startRef = useRef<number | null>(null)
-  const [, forceTick] = useState(0)
-
-  if (startRef.current === null && job.status === 'running') {
-    startRef.current = Date.now()
-  }
-
-  useEffect(() => {
-    if (job.status !== 'running') return
-    const id = setInterval(() => forceTick((n) => n + 1), 1000)
-    return () => clearInterval(id)
-  }, [job.status])
-
-  if (job.status !== 'running' || startRef.current === null || job.pages_done === 0) {
-    return null
-  }
-  const elapsedS = (Date.now() - startRef.current) / 1000
-  const avgPerPage = elapsedS / job.pages_done
-  const remaining = job.pages_total - job.pages_done
-  return remaining > 0 ? avgPerPage * remaining : 0
+// The user-facing label for each trace stage - see trace.STAGE_NAMES.
+// "ranking" is edition-wide, never reported on a per-page basis here.
+const STAGE_LABELS: Record<string, string> = {
+  char_extraction: 'extracting characters',
+  line_building: 'building lines',
+  ligature_canary: 'checking for dropped glyphs',
+  gemini_call: 'identifying articles (Gemini)',
+  validation: 'validating',
+  assembly: 'assembling article',
 }
 
 function formatEta(seconds: number): string {
@@ -48,11 +30,23 @@ function formatEta(seconds: number): string {
   return `~${Math.ceil(seconds / 60)}m remaining`
 }
 
+function formatElapsed(seconds: number): string {
+  if (seconds < 60) return `${Math.floor(seconds)}s elapsed`
+  const m = Math.floor(seconds / 60)
+  const s = Math.floor(seconds % 60)
+  return `${m}m ${s}s elapsed`
+}
+
 export function ProgressPanel({ job }: { job: JobStatusOut }) {
-  const currentPage = job.per_page.find((p) => p.status === 'extracting' || p.status === 'grouping')
+  // Phase 1 (char_extraction/line_building/ligature_canary) is strictly
+  // sequential - at most one page will ever be "extracting". Phase 2
+  // (gemini_call/validation/assembly) runs multiple pages concurrently
+  // (config.concurrency.max_concurrent) - showing all of them, not just
+  // the first, is what makes that parallelism visible instead of looking
+  // stalled.
+  const inFlight = job.per_page.filter((p) => p.status === 'extracting' || p.status === 'grouping')
   const articleCount = job.per_page.reduce((sum, p) => sum + (p.articles_found ?? 0), 0)
   const failures = job.per_page.filter((p) => p.status === 'failed' || p.validation_ok === false)
-  const etaSeconds = useEtaSeconds(job)
 
   return (
     <div className="flex flex-col gap-4 rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
@@ -62,13 +56,27 @@ export function ProgressPanel({ job }: { job: JobStatusOut }) {
             ? `Done - ${job.pages_total} page${job.pages_total === 1 ? '' : 's'} processed`
             : job.status === 'failed'
               ? 'Job failed'
-              : currentPage
-                ? `Page ${currentPage.page_num} of ${job.pages_total}`
-                : `Starting - ${job.pages_total || '?'} pages`}
-          {etaSeconds !== null && <span className="ml-2 text-slate-400">({formatEta(etaSeconds)})</span>}
+              : `${job.pages_done} of ${job.pages_total || '?'} pages done`}
         </span>
         <span className="text-sm text-slate-500">{articleCount} article{articleCount === 1 ? '' : 's'} found</span>
       </div>
+
+      {job.status === 'running' && (
+        <div className="flex items-center gap-3 text-xs text-slate-400">
+          <span>{formatElapsed(job.elapsed_s)}</span>
+          {job.eta_s !== null && job.eta_s !== undefined && <span>({formatEta(job.eta_s)})</span>}
+        </div>
+      )}
+
+      {job.status === 'running' && inFlight.length > 0 && (
+        <div className="flex flex-col gap-1">
+          {inFlight.map((p) => (
+            <p key={p.page_num} className="text-xs text-slate-600">
+              Page {p.page_num} of {job.pages_total} — {STAGE_LABELS[p.current_stage ?? ''] ?? 'processing'}
+            </p>
+          ))}
+        </div>
+      )}
 
       {job.all_cached && job.status === 'done' && (
         <p className="rounded-lg bg-teal-50 px-3 py-2 text-xs text-teal-700">

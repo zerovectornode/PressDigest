@@ -1,5 +1,17 @@
 import { Link } from 'react-router-dom'
+import { formatTimestamp } from '../lib/format'
 import { useEditions } from '../lib/queries'
+
+function statusBadgeClass(status: string | null | undefined): string {
+  switch (status) {
+    case 'running':
+      return 'bg-amber-100 text-amber-700'
+    case 'failed':
+      return 'bg-rose-100 text-rose-700'
+    default:
+      return 'bg-teal-100 text-teal-700'
+  }
+}
 
 export function EditionsList() {
   const { data: editions, isLoading } = useEditions()
@@ -23,10 +35,20 @@ export function EditionsList() {
             <div>
               <p className="font-medium capitalize text-slate-800">{edition.edition}</p>
               <p className="text-xs text-slate-500">{edition.date}</p>
+              {edition.extracted_at && (
+                <p className="text-xs text-slate-400">extracted {formatTimestamp(edition.extracted_at)}</p>
+              )}
             </div>
-            <div className="text-right text-xs text-slate-500">
-              <p>{edition.page_count} pages</p>
-              <p>{edition.article_count} articles</p>
+            <div className="flex items-center gap-3">
+              <div className="text-right text-xs text-slate-500">
+                <p>{edition.page_count} pages</p>
+                <p>{edition.article_count} articles</p>
+              </div>
+              {edition.status && (
+                <span className={`rounded-full px-2 py-0.5 text-xs font-medium ${statusBadgeClass(edition.status)}`}>
+                  {edition.status}
+                </span>
+              )}
             </div>
           </Link>
         </li>

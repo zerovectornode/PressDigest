@@ -1,7 +1,9 @@
-import { useCallback, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
+import { Link } from 'react-router-dom'
 import { EditionsList } from '../components/EditionsList'
 import { ProgressPanel } from '../components/ProgressPanel'
-import { useCreateEdition, useJobStatus, useParseMetadata } from '../lib/queries'
+import { makeEditionId } from '../lib/api'
+import { useActiveJobs, useCreateEdition, useJobStatus, useParseMetadata } from '../lib/queries'
 
 export function Dashboard() {
   const [file, setFile] = useState<File | null>(null)
@@ -9,10 +11,29 @@ export function Dashboard() {
   const [date, setDate] = useState('')
   const [isDragging, setIsDragging] = useState(false)
   const [jobId, setJobId] = useState<string | null>(null)
+  const [reconnected, setReconnected] = useState(false)
 
   const parseMetadata = useParseMetadata()
   const createEdition = useCreateEdition()
   const jobQuery = useJobStatus(jobId)
+  const activeJobsQuery = useActiveJobs()
+
+  // Reconnection: a job survives a browser reload (it runs server-side,
+  // independent of any HTTP connection - see design/DESIGN.md), but jobId
+  // lives only in this component's state, so without this a reload would
+  // otherwise show the empty upload UI as if nothing were running. Only
+  // acts once, and only if the user hasn't already started/selected a job
+  // in this session.
+  useEffect(() => {
+    if (reconnected || jobId !== null || file !== null) return
+    const active = activeJobsQuery.data?.[0]
+    if (active) {
+      setJobId(active.job_id)
+      setEdition(active.edition)
+      setDate(active.date)
+      setReconnected(true)
+    }
+  }, [activeJobsQuery.data, reconnected, jobId, file])
 
   const handleFile = useCallback(
     (selected: File) => {
@@ -44,6 +65,8 @@ export function Dashboard() {
   }
 
   const canExtract = Boolean(file && edition && date) && !createEdition.isPending && jobId === null
+  const showPanel = file !== null || jobId !== null
+  const firstPageDone = jobQuery.data?.per_page[0]?.status === 'done'
 
   return (
     <div className="mx-auto flex max-w-3xl flex-col gap-8 px-8 py-10">
@@ -89,7 +112,7 @@ export function Dashboard() {
         )}
       </div>
 
-      {file && (
+      {showPanel && (
         <div className="flex flex-col gap-4 rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
           <div className="flex gap-4">
             <label className="flex flex-1 flex-col gap-1 text-sm">
@@ -128,7 +151,17 @@ export function Dashboard() {
               {createEdition.isPending ? 'Starting...' : 'Extract'}
             </button>
           ) : jobQuery.data ? (
-            <ProgressPanel job={jobQuery.data} />
+            <>
+              <ProgressPanel job={jobQuery.data} />
+              {firstPageDone && (
+                <Link
+                  to={`/reader/${makeEditionId(edition, date)}/1`}
+                  className="self-start rounded-lg border border-teal-300 bg-teal-50 px-3 py-1.5 text-sm font-medium text-teal-700 hover:bg-teal-100"
+                >
+                  Start reading page 1 →
+                </Link>
+              )}
+            </>
           ) : (
             <p className="text-sm text-slate-400">Starting job...</p>
           )}

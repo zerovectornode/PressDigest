@@ -10,6 +10,7 @@ import logging
 import os
 import shutil
 import sys
+import time
 from contextlib import asynccontextmanager
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
@@ -27,10 +28,10 @@ from hindu_extract.api import runs as runs_lib
 from hindu_extract.api.edition_id import InvalidEditionId, split_edition_id
 from hindu_extract.api.metadata_parser import parse_metadata_from_pdf
 from hindu_extract.api.schemas import (
-    ArticleOut,
     EditionDetailOut,
     EditionSummaryOut,
     JobStatusOut,
+    PageArticlesOut,
     PageOut,
     ParsedMetadataOut,
     PagePhaseOut,
@@ -201,11 +202,15 @@ async def create_edition(file: UploadFile, edition: str, date: str):
     return StartJobOut(job_id=job_id, edition=edition, date=date)
 
 
-@app.get("/api/jobs/{job_id}", response_model=JobStatusOut)
-async def get_job_status(job_id: str):
-    record = jobs.get_job(job_id)
-    if record is None:
-        raise HTTPException(status_code=404, detail=f"no job {job_id!r}")
+def _job_to_status_out(record: jobs.JobRecord) -> JobStatusOut:
+    elapsed_s = 0.0
+    eta_s = None
+    if record.started_at is not None:
+        elapsed_s = (record.finished_at or time.time()) - record.started_at
+        if record.status == "running" and record.pages_done > 0:
+            avg_per_page = elapsed_s / record.pages_done
+            remaining = record.pages_total - record.pages_done
+            eta_s = avg_per_page * remaining if remaining > 0 else 0.0
     return JobStatusOut(
         job_id=record.job_id,
         edition=record.edition,
@@ -216,7 +221,25 @@ async def get_job_status(job_id: str):
         per_page=[PagePhaseOut(**vars(p)) for p in record.per_page],
         all_cached=record.all_cached,
         error=record.error,
+        elapsed_s=elapsed_s,
+        eta_s=eta_s,
     )
+
+
+@app.get("/api/jobs/active", response_model=list[JobStatusOut])
+async def list_active_jobs_route():
+    """Lets the Dashboard reconnect to a job that's still running after a
+    page reload, without already knowing its job_id - see design/DESIGN.md
+    and the plan's Enhancement 4."""
+    return [_job_to_status_out(r) for r in jobs.list_active_jobs()]
+
+
+@app.get("/api/jobs/{job_id}", response_model=JobStatusOut)
+async def get_job_status(job_id: str):
+    record = jobs.get_job(job_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"no job {job_id!r}")
+    return _job_to_status_out(record)
 
 
 @app.get("/api/editions", response_model=list[EditionSummaryOut])
@@ -254,22 +277,36 @@ async def get_page_route(edition_id: str, page_num: int):
         edition, date = split_edition_id(edition_id)
     except InvalidEditionId as e:
         raise HTTPException(status_code=400, detail=str(e))
-    page = pages_lib.get_page(config, edition, date, page_num)
-    if page is None:
+    status = editions_lib.get_page_status(config, edition, date, page_num)
+    if status is None:
         raise HTTPException(status_code=404, detail=f"no page {page_num} for edition {edition_id!r}")
-    return page
+    if status != "done":
+        return PageOut(
+            page_num=page_num,
+            status=status,
+            width=None,
+            height=None,
+            line_count=None,
+            article_count=0,
+            validation_ok=False,
+            coverage_ratio=None,
+        )
+    return pages_lib.get_page(config, edition, date, page_num)
 
 
-@app.get("/api/editions/{edition_id}/pages/{page_num}/articles", response_model=list[ArticleOut])
+@app.get("/api/editions/{edition_id}/pages/{page_num}/articles", response_model=PageArticlesOut)
 async def get_page_articles_route(edition_id: str, page_num: int):
     try:
         edition, date = split_edition_id(edition_id)
     except InvalidEditionId as e:
         raise HTTPException(status_code=400, detail=str(e))
-    articles = pages_lib.get_page_articles(config, edition, date, page_num)
-    if articles is None:
-        raise HTTPException(status_code=404, detail=f"no gold articles for page {page_num} of edition {edition_id!r}")
-    return articles
+    status = editions_lib.get_page_status(config, edition, date, page_num)
+    if status is None:
+        raise HTTPException(status_code=404, detail=f"no page {page_num} for edition {edition_id!r}")
+    if status != "done":
+        return PageArticlesOut(status=status, articles=[])
+    articles = pages_lib.get_page_articles(config, edition, date, page_num) or []
+    return PageArticlesOut(status="done", articles=articles)
 
 
 # --- Step D: pipeline monitoring ("Pipeline" view) --------------------------

@@ -6,6 +6,7 @@ import pytest
 
 from hindu_extract.trace import (
     RunTracer,
+    get_latest_run_for_edition,
     get_page_raw,
     get_page_stages,
     get_quota_usage,
@@ -144,6 +145,50 @@ def test_get_run_pages_returns_distinct_page_numbers_in_order(db_path):
         pass
 
     assert get_run_pages(db_path, tracer.run_id) == [1, 2]
+
+
+def test_on_stage_start_fires_before_the_stage_body_runs(db_path):
+    seen = []
+    tracer = RunTracer(
+        db_path=db_path,
+        run_id=new_run_id(),
+        on_stage_start=lambda page_num, stage_name: seen.append((page_num, stage_name)),
+    )
+    tracer.start_run("delhi", "2025-09-13", None, 1)
+    with tracer.stage(3, "char_extraction"):
+        assert seen == [(3, "char_extraction")]  # already fired by the time the body runs
+    assert seen == [(3, "char_extraction")]  # and not fired again on exit
+
+
+def test_on_stage_start_exception_does_not_break_the_stage(db_path):
+    def boom(page_num, stage_name):
+        raise RuntimeError("UI plumbing must never break extraction")
+
+    tracer = RunTracer(db_path=db_path, run_id=new_run_id(), on_stage_start=boom)
+    tracer.start_run("delhi", "2025-09-13", None, 1)
+    with tracer.stage(1, "char_extraction") as detail:
+        detail["char_count"] = 10
+
+    events = get_page_stages(db_path, tracer.run_id, 1)
+    assert len(events) == 1
+    assert events[0]["error"] is None
+
+
+def test_get_latest_run_for_edition_prefers_most_recent(db_path):
+    t1 = RunTracer(db_path=db_path, run_id=new_run_id())
+    t1.start_run("delhi", "2025-09-13", None, 1)
+    t1.finish_run("failed")
+    t2 = RunTracer(db_path=db_path, run_id=new_run_id())
+    t2.start_run("delhi", "2025-09-13", None, 1)
+    t2.finish_run("done")
+
+    latest = get_latest_run_for_edition(db_path, "delhi", "2025-09-13")
+    assert latest["run_id"] == t2.run_id
+    assert latest["status"] == "done"
+
+
+def test_get_latest_run_for_edition_returns_none_when_no_runs_exist(db_path):
+    assert get_latest_run_for_edition(db_path, "nonexistent", "2000-01-01") is None
 
 
 def test_quota_usage_counts_gemini_calls_today_and_tokens_last_minute(db_path):

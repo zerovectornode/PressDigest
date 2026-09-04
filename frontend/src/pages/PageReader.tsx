@@ -103,7 +103,13 @@ export function PageReader() {
     )
   }
 
-  const totalPages = editionQuery.data?.page_count
+  // pages covers every page number the edition will ever have (including
+  // ones not extracted yet); page_count only counts pages with gold
+  // output so far - navigation bounds must use the former, or a
+  // still-processing page near the end of the edition couldn't be reached.
+  const pageStatuses = editionQuery.data?.pages
+  const totalPages = pageStatuses?.length ?? editionQuery.data?.page_count
+  const pageStatusFor = (n: number) => pageStatuses?.find((p) => p.page_num === n)?.status
 
   const goToPage = (n: number) => {
     if (totalPages !== undefined && (n < 1 || n > totalPages)) return
@@ -126,15 +132,31 @@ export function PageReader() {
   if (pageQuery.isError || !pageQuery.data) {
     return (
       <EmptyState
-        title={`Page ${pageNum} isn't ready yet`}
-        description="This page hasn't finished extraction, or doesn't exist for this edition."
+        title={`Page ${pageNum} doesn't exist`}
+        description="This page number is out of range for this edition."
         linkTo="/"
         linkLabel="Go to Home"
       />
     )
   }
 
-  const articles = articlesQuery.data ?? []
+  if (pageQuery.data.status !== 'done') {
+    const stillFailed = pageQuery.data.status === 'failed'
+    return (
+      <EmptyState
+        title={stillFailed ? `Page ${pageNum} failed to extract` : `Page ${pageNum} is still being extracted`}
+        description={
+          stillFailed
+            ? 'Extraction hit an error on this page - check the Pipeline view for details.'
+            : "This page hasn't finished extraction yet - this'll update automatically once it's done."
+        }
+        linkTo="/"
+        linkLabel="Go to Home"
+      />
+    )
+  }
+
+  const articles = articlesQuery.data?.articles ?? []
   const page = pageQuery.data
   const visibleArticles =
     articles.length > VIRTUALIZE_THRESHOLD && !expanded ? articles.slice(0, VIRTUALIZE_THRESHOLD) : articles
@@ -175,6 +197,7 @@ export function PageReader() {
             <button
               onClick={() => goToPage(pageNum - 1)}
               disabled={pageNum <= 1}
+              title={pageStatusFor(pageNum - 1) && pageStatusFor(pageNum - 1) !== 'done' ? 'not ready yet' : undefined}
               className="rounded-md border border-slate-300 px-2 py-1 text-xs text-slate-600 hover:bg-slate-50 disabled:opacity-40"
             >
               ← Prev
@@ -192,9 +215,10 @@ export function PageReader() {
             <button
               onClick={() => goToPage(pageNum + 1)}
               disabled={totalPages !== undefined && pageNum >= totalPages}
+              title={pageStatusFor(pageNum + 1) && pageStatusFor(pageNum + 1) !== 'done' ? 'not ready yet' : undefined}
               className="rounded-md border border-slate-300 px-2 py-1 text-xs text-slate-600 hover:bg-slate-50 disabled:opacity-40"
             >
-              Next →
+              Next → {pageStatusFor(pageNum + 1) && pageStatusFor(pageNum + 1) !== 'done' && '(extracting)'}
             </button>
             <span className="ml-1 text-sm font-medium text-slate-700">
               Page {pageNum} — {page.article_count} article{page.article_count === 1 ? '' : 's'}

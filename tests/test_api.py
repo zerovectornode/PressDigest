@@ -124,7 +124,9 @@ def test_full_upload_job_completes_and_edition_is_listed():
 
     r = client.get(f"/api/editions/{edition_id}/pages/{page_with_articles}/articles")
     assert r.status_code == 200
-    articles = r.json()
+    page_articles_out = r.json()
+    assert page_articles_out["status"] == "done"
+    articles = page_articles_out["articles"]
     assert len(articles) == page_out["article_count"]
     article = articles[0]
     assert isinstance(article["deck"], list)
@@ -136,7 +138,7 @@ def test_full_upload_job_completes_and_edition_is_listed():
     if zero_article_page is not None:
         r = client.get(f"/api/editions/{edition_id}/pages/{zero_article_page}/articles")
         assert r.status_code == 200
-        assert r.json() == []
+        assert r.json() == {"status": "done", "articles": []}
 
     r = client.get(f"/api/editions/{edition_id}/pages/9999")
     assert r.status_code == 404
