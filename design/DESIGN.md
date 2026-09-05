@@ -1490,3 +1490,313 @@ there's no measured baseline yet for what "normal" resident memory looks
 like *after* this fix, and guessing a number risks the opposite failure
 mode (killing a legitimate extraction under normal load). Revisit once
 `_log_system_stats`/`memory.peak` have a few real data points post-fix.
+
+## Gemini retry, failed-page handling, and edition deletion
+
+Prompted by a real incident: **2026-09-04, run `c5124271`**, a 20-page
+extract, page 1 failed with `503 UNAVAILABLE - "This model is currently
+experiencing high demand"` after 7.73s. The job correctly kept going (Phase
+2's per-page isolation already worked), finishing the other 19 pages in
+465.8s / 213,295 tokens - but page 1's failure was then unrecoverable: the
+Page Reader showed "Page 1 is still being extracted" forever, with no way
+to read any other page either. Investigating this surfaced three separate,
+compounding gaps, fixed together below.
+
+### Retry policy (`gemini_client.py`, `config/default.yaml` `gemini_retry:`)
+
+Before this, `gemini_client.py` only retried 429s (exponential backoff, no
+jitter, up to 5 attempts) - a 503/500/504 or a connection/read timeout
+failed on the very first attempt, exactly what happened. The new policy,
+entirely in `config/default.yaml`'s `gemini_retry:` block so none of it is
+hardcoded:
+
+- `max_attempts: 4` (1 initial + 3 retries) - long enough to ride out a
+  multi-minute demand spike without one page blocking an otherwise-fine
+  edition indefinitely.
+- `base_delay_s: 4.0`, `multiplier: 2.0` -> nominal ladder 4s/8s/16s,
+  `max_delay_s: 30.0` caps it.
+- `jitter: 0.5` (actual sleep = uniform(0.5x, 1.5x) of nominal) -
+  specifically because production Phase 2 concurrency is 2
+  (`HINDU_EXTRACT_MAX_CONCURRENT=2`): un-jittered retries would land two
+  concurrent workers back into the same demand spike in lockstep, every
+  time.
+- `timeout_s: 120.0` per attempt, via the SDK's own `types.HttpOptions`,
+  not a hand-rolled thread timeout - well above the ~9-10s MEDIUM-thinking
+  baseline, so it only fires for a genuinely hung connection, which then
+  counts as retryable like any other transient failure.
+
+Classification (`gemini_client._classify_error`): `google.genai.errors.
+ServerError` (500/503/504) and the SDK's underlying `httpx`/`requests`
+connection/timeout exceptions are retryable; `ClientError` (400/401/403/
+404) and our own `GeminiError` (MAX_TOKENS truncation, empty response) are
+not - retrying a deterministic, schema-level failure just burns quota on
+an identical outcome. 429 `RESOURCE_EXHAUSTED` is a separate path
+(`quota_retry_after_cap_s: 90.0`, `quota_fallback_delay_s: 60.0`): honour
+the API's own `retry-after`/`RetryInfo` hint when present (capped), else
+wait one fallback window, and retry **once** - never on the ladder above.
+At 21 calls/edition and concurrency 2 against 15 RPM / 250K TPM, RPM/TPM
+exhaustion is implausible, so a 429 is far more likely the daily (RPD)
+cap; `_is_daily_quota_exhausted` best-effort-detects that case (looking
+for "day" alongside quota language in the message/details, since the SDK
+gives no structured quota-metric field to check exactly) and raises
+`QuotaExhaustedError` immediately, no retry - RPD resets at midnight
+Pacific (~12:30 PM IST), which no single pipeline run can wait for.
+
+The retry loop lives in `_generate_with_retry`, the transport-layer
+function both `call_gemini` (Phase 2) and `ranking.py`'s
+`_call_gemini_for_ranking` (Phase 4) already funnelled their SDK call
+through (as `_generate_with_backoff`, its predecessor) - so both call
+sites got the new policy with zero changes to `ranking.py` or
+`grouping.py`, confirming the assumption that the transport layer really
+was already shared for this purpose, even though the surrounding
+cache/prompt/trace scaffolding around it is duplicated between the two
+files.
+
+**Deliberately not using** the SDK's own declarative
+`types.HttpOptions(retry_options=types.HttpRetryOptions(...))`, even
+though its fields (`attempts`, `initial_delay`, `max_delay`, `exp_base`,
+`jitter`) line up almost exactly with the policy above - it would retry
+silently inside the transport layer, with no hook for the per-attempt
+trace observability below. `HttpOptions(timeout=...)` alone is used, for
+the per-attempt timeout only.
+
+Cache behavior needed no changes at all: `call_gemini` only ever writes
+the response cache after a successful `json.loads(response.text)`, at the
+very end of the function - a failed attempt (of any kind, retried or not)
+was already never reachable from there, and a successful retry's result
+is written exactly like a first-attempt success (same code path, cache key
+unaffected by how many attempts it took).
+
+**Observability**: no trace DB schema/table change. Each attempt (number,
+elapsed, sleep applied, error code/message) is appended to
+`detail["attempts"]` on the *same* `gemini_call` stage_event row that
+already existed, plus `detail["attempt_count"]` and
+`detail["sleep_total_s"]`. This works because `tracer.stage()`'s measured
+duration already spans the whole retry loop including sleeps (nothing
+about the stage boundary changed), and `detail_json` was already a
+free-form blob. The Pipeline dashboard's per-page timeline
+(`PipelineRunDetail.tsx`) shows a small "N attempts" badge next to a
+page's `gemini_call` segment when `attempt_count > 1`, and the segment's
+hover tooltip now includes each failed attempt's error message. Every
+retry is also logged at WARNING with page number, attempt, error code, and
+sleep duration.
+
+### Page and run failure state model
+
+Investigating the incident found the "still extracting" message was not a
+frontend bug - `PageReader.tsx` already had a `status === 'failed'`
+branch ready to render, it just never received `"failed"` from the API.
+The live `JobRecord`/`PagePhase.status` (`jobs.py`) already tracked
+`"failed"` for a page whose Phase 2 raised - but only in memory, and only
+for as long as the job stayed in `ACTIVE_JOB_STATUSES` (`queued`/
+`running`). The instant the run finished (even with a failed page - see
+below), that signal was gone: `editions.get_page_status()`'s disk fallback
+could only ever answer `"pending"` or `"done"`, since it only looked at
+whether gold `articles.json` existed.
+
+Fixed with a new durable artifact, `data/gold/{edition}/{date}/page_NN/
+error.json` (`page_errors.py`) - `{stage, code, message, attempt_count,
+failed_at}`. Written on any page failure (Phase 1 or Phase 2), cleared on
+that page's next success. `error.json` and `articles.json` are mutually
+exclusive by construction (a failing run never gets far enough to write
+`articles.json`; a successful run always clears `error.json` first) -
+nothing enforces that as an invariant beyond both call sites doing it in
+the right order. `editions.get_page_status` now checks it before falling
+back to pending, and it's the only thing that turns "on-disk, no gold"
+into `"failed"` instead of `"pending"` once a job is gone.
+
+A second, no-schema-change fact: **Phase 1 had no per-page error isolation
+at all**, unlike Phase 2's existing `error_callback`. A hard Phase 1
+failure (a corrupt page, `EmptyPageError`) used to propagate out of
+`extract_pages`'s whole loop, killing every other page in the edition -
+not just the one that failed. Fixed by giving `extract_pages` the same
+`error_callback` isolation Phase 2 already had (factored the per-page body
+into `pipeline._page_outcome`, reused by both `extract_pages`'s loop and
+the new `pipeline.retry_single_page`). Caught while doing this: `_run_job`
+used to pass the *original* full `page_nums` list to Phase 2 regardless of
+which pages Phase 1 actually succeeded for - now it only passes
+`extracted_page_nums`, the ones that survived Phase 1, or Phase 2 would
+attempt a page with no bronze lines to group at all.
+
+Run-level status (`RunStatusValue`/`JobStatusValue`) gained
+`"completed_with_errors"`, computed identically in both places (the live
+`JobRecord` in `jobs.py`, and `tracer.finish_run(...)`) - any page ended
+`"failed"` at completion time. `failed_pages` on `RunSummaryOut`/
+`EditionSummaryOut`/`EditionDetailOut` is *derived*, not stored: `SELECT
+DISTINCT page_num FROM stage_events WHERE run_id=? AND error IS NOT NULL`
+(`trace.get_failed_pages_for_run`) - a stage_events row already records
+its error in the existing `finally` block, so this works retroactively
+against already-recorded runs too, no backfill needed.
+
+One more knock-on fix: `editions.list_editions`/`get_edition_detail` used
+to gate existence on "does at least one page have gold `articles.json`" -
+an edition where *every* page failed had zero gold output and so
+vanished entirely (404/absent from the list), exactly the kind of dead
+end this work is trying to close. Existence is now "was this edition ever
+extracted at all" (a Phase 1 manifest or an active job), which
+`error.json` being written under `gold_page_dir` even for a page that
+never produced articles satisfies on its own.
+
+Two retry actions reuse existing machinery rather than adding new
+plumbing: a single-page retry (`POST /pages/{n}/retry`, sync, matching
+`trigger_ranking_route`'s existing sync-in-threadpool pattern) calls
+`pipeline.retry_single_page` (Phase 1, cache hit if it already succeeded)
+then `process_page_articles` (Phase 2) directly - deliberately *not*
+`extract_pages`, since that function unconditionally rewrites
+`manifest.json`'s `page_count` to `len(page_nums)`, which would corrupt a
+20-page edition's manifest down to 1 (caught while implementing this - see
+`tests/test_page_failure_and_deletion.py`). Bulk "retry N failed pages"
+(`POST /retry-failed`) reuses `jobs.py`'s existing background-job
+machinery (`_EXECUTOR`/`JobRecord`) scoped to just the failed page_nums
+and skipping Phase 1 entirely, so the Dashboard's existing progress-panel
+polling covers it for free.
+
+### Edition deletion (`delete_edition.py`)
+
+One function, `delete_edition(config, edition, date)`, used by both the
+interactive `DELETE /api/editions/{id}` endpoint and
+`deploy/prune_editions.py`'s timer-driven sweep, specifically so the two
+paths cannot drift on what "delete an edition" means. It removes the
+stored raw PDF, bronze, and gold directories for that edition+date, plus
+its trace DB rows (`runs`/`stage_events`/`gemini_raw`, matched by
+`edition`+`date` on the `runs` table, then joined via `run_id` for the
+other two - no schema change).
+
+**It never touches `config.gemini_cache_root` or `config.ranking_cache_root`.**
+Both are content-addressed (keyed by a hash of the prompt/model/settings,
+not edition/date), so they're shared across editions and outlive any one
+of them by design - the whole reason a re-extraction of an unchanged PDF
+costs $0 and zero live calls. Deleting them on edition delete would
+silently turn that into ~21 live Gemini calls on the next re-extract. This
+is stated directly in `delete_edition.py`'s module docstring so it isn't
+"cleaned up" later by someone tidying deletion logic who doesn't know why
+two cache directories are conspicuously absent from the delete list.
+
+Refactoring `prune_editions.py` onto this shared function surfaced two
+pre-existing gaps in it, fixed as part of this same change: it never
+cleaned up trace rows at all (now it does, via the shared function), and
+its cache-pruning loop only excluded the `gemini` subdirectory by name,
+not `ranking` - since `ranking_cache_root` (`data/cache/ranking`) is also
+a plain top-level directory under `cache_root`, the old loop could have
+treated the entire ranking cache as one stale `pdf_hash` directory and
+deleted it wholesale. `prune_editions.py` now also needs
+`PYTHONPATH=/opt/pressdigest/app/src` in its systemd unit (it previously
+imported nothing from `hindu_extract`; now it imports
+`hindu_extract.delete_edition`) - added to `deploy/pressdigest-prune.service`.
+
+Safety: every path `delete_edition` touches is resolved (symlinks
+followed) and checked against `config.data_anchor / "data"` before any
+`rmtree` - checked *before* the existence check, not after, so a bogus
+edition/date string containing `..` is refused outright rather than
+silently doing nothing just because the (unsafe) resolved path happens
+not to exist yet. This runs as root via systemd on the VM. Deletion is
+**blocked**, not cancelled, while a job is active for that edition
+(`jobs.get_active_job_for_edition`, checked by the API route before ever
+calling `delete_edition`) - there is no cooperative cancellation for a
+job's background thread today (a deliberate v1 choice, see `jobs.py`'s
+module docstring), and interrupting a blocking Gemini call mid-write is a
+meaningfully bigger feature than this one. `prune_editions.py` doesn't
+repeat this check itself - it runs as a separate process via a systemd
+timer with no access to the live API process's in-memory `_JOBS` at all,
+and in practice only ever targets editions stale by weeks, never a live
+job's edition.
+
+### Retryable/non-retryable, and end-to-end verification against the real app
+
+A scope-checked follow-up before deploying the above: don't offer "Retry
+this page" on a failure that's deterministic - retrying a 400
+INVALID_ARGUMENT, a MAX_TOKENS truncation, or a Phase 1 `EmptyPageError`
+just reproduces the identical outcome. `gemini_client.is_retryable(error)`
+is the single flag reused everywhere this matters - the retry ladder's own
+`_classify_error` classification (`ServerError`/transport errors and 429 ->
+`True`; a non-429 `ClientError` -> `False`), plus `GeminiError` (and its
+`QuotaExhaustedError` subclass) always `False`, since both are
+deterministic given the same input. No second severity taxonomy anywhere:
+`page_errors.PageError.retryable` is set from this exact function at every
+call site (`jobs.py`'s Phase 1/Phase 2 failure recorders and
+`retry_page_sync`), persisted in `error.json`, exposed on `PageErrorOut`,
+and read by `FailedPageState.tsx` to hide the retry button and explain why
+("This failure is deterministic - a retry will produce the same result.")
+A Phase 1 hard-fail (`EmptyPageError` - the closest thing to "a canary
+trip" causing a real failure; canary *findings* themselves never raise,
+only the zero-line check does) correctly lands non-retryable through this
+same function, confirmed by a dedicated test rather than by inspection
+alone. `word_fusion_review.py` was not touched - still a soft, non-blocking
+dictionary sweep with no bearing on `validation_ok`/retryability.
+
+Second follow-up: `error.json` must never be cleared before a retry is
+attempted, only after it succeeds. `jobs.py`'s `retry_page_sync` and
+`_run_retry_job` used to clear it up front; now neither does - a retry
+that fails again just has `write_page_error` overwrite the old error with
+the new one, so there's never a window with no error recorded at all for
+a page that's still broken. `page_errors.write_page_error` itself now
+writes via temp-file-then-`os.replace` (atomic on POSIX and Windows)
+rather than a direct `write_text`, so a crash mid-write can't leave a
+half-written `error.json` either. Two structural facts worth recording
+rather than re-deriving later: `process_page_articles` never writes any
+gold output until *after* both Gemini's response and Phase 3 validation
+have already succeeded - a failure at either point leaves gold untouched,
+nothing partial. It does, however, write `articles.json` before `page.md`
+- a crash between those two specific lines would leave a page looking
+"done" (gold exists) with no page.md rendered. Flagged, not built for -
+no evidence it's ever happened, and `get_page_status` already checks
+`articles.json`'s existence, not `page.md`'s, for "done".
+
+**Verified against the real running app, once, per the request that
+mocked tests can pass while the real path still dead-ends.** Mechanism: a
+scratch script (outside the repo, never committed) that monkeypatches
+`gemini_client._generate_with_retry` so every attempt for `page_num == 1`
+raises the incident's exact `503 UNAVAILABLE` error, then launches the
+real app with `uvicorn` in-process - real retry ladder, real sleeps, real
+Gemini calls for every other page. The project's Gemini cache directory
+was moved aside first (then merged back afterward) so the run was
+genuinely fresh, not a cache replay. Observed, via the live API (not by
+re-reading the code): page 1 failed after exactly 4 attempts, sleeping
+5.45s / 9.51s / 22.97s between them (jittered 4s/8s/16s nominal, capped at
+30s, as configured) - `gemini_call` stage duration 39.6s, of which 37.9s
+was sleeping. The run reported `completed_with_errors` with
+`failed_pages: [1]`; every other page (19 of 20, real Gemini calls,
+`cache_hit_ratio: 0.0`) came back `"done"` and readable, with real
+article content. `GET /pages/1` returned `status: "failed"` with the
+structured error (`stage: "gemini_call"`, `code: 503`, `attempt_count: 4`,
+`retryable: true`) - not "still being extracted." Removing the patch and
+calling `POST /pages/1/retry` succeeded on the first real attempt;
+`char_extraction`/`line_building`/`ligature_canary` all measured `0.0s`
+(Phase 1 cache hit, confirmed, not assumed) while `gemini_call` took a
+real 16.6s; `error.json` was gone from disk immediately after. Deleting
+that edition reported `bytes_freed` correctly, and a subsequent
+re-extraction of the identical PDF came back `cache_hit_ratio: 1.0` in
+4.6s total - zero live calls, the actual proof that delete preserved the
+cache.
+
+Two things this verification pass surfaced, neither fixed here (flagging
+per the same "don't build for it now" instruction that governed the gold-
+write-ordering question above):
+
+1. **Stale gold can mask a fresh failure on re-extraction.** The first
+   verification attempt reused an edition whose page 1 had already
+   succeeded in an earlier, unrelated run. When the forced 503 made that
+   *same* page fail on re-extraction, `error.json` was written correctly,
+   and `failed_pages` (derived from `stage_events`) correctly showed `[1]`
+   at the run level - but `get_page_status`'s edition-level `pages` array
+   still reported page 1 as `"done"`, because `_has_gold` is checked
+   before `error.json` and the *old* `articles.json` was still sitting
+   there, untouched by the new failure. A brand-new edition (page 1 never
+   previously succeeded) does not have this problem, and is the scenario
+   that actually matches the 2026-09-04 incident - confirmed separately,
+   correctly showing `"failed"`. Re-extracting an edition where a
+   previously-good page fails this time is the one case where the reader
+   would currently show stale old content instead of the new failure.
+2. **`delete_edition`'s directory removal left empty directory shells
+   behind on this Windows/OneDrive-synced dev machine** - every file
+   inside was actually removed (disk content genuinely freed, confirmed
+   with `du`), but the now-empty `page_NN` subdirectories didn't get
+   `rmdir`'d, matching the exact same OneDrive-sync file-lock symptom seen
+   earlier in this project with an unrelated temp directory (see the
+   canary-fix and Gemini-retry work). `shutil.rmtree(..., ignore_errors=
+   True)` swallows that failure silently. Functionally harmless here -
+   `get_total_page_count` already treats an edition with zero
+   `articles.json` files as nonexistent regardless of empty leftover
+   directories, confirmed live - and very unlikely to reproduce on the
+   Linux VM's plain ext4-backed `/var/lib/pressdigest/data`, which is why
+   this is a note, not a fix.

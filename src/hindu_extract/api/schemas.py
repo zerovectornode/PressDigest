@@ -7,10 +7,18 @@ from typing import Literal
 
 from pydantic import BaseModel
 
-JobStatusValue = Literal["queued", "running", "done", "failed"]
+JobStatusValue = Literal["queued", "running", "done", "completed_with_errors", "failed"]
 PagePhaseValue = Literal["pending", "extracting", "grouping", "done", "failed"]
 PageStatusValue = Literal["pending", "in_progress", "done", "failed"]
-RunStatusValue = Literal["running", "done", "failed"]
+RunStatusValue = Literal["running", "done", "completed_with_errors", "failed"]
+
+
+class PageErrorOut(BaseModel):
+    stage: str
+    code: str | int | None
+    message: str
+    attempt_count: int
+    retryable: bool
 
 
 class ParsedMetadataOut(BaseModel):
@@ -26,7 +34,7 @@ class PagePhaseOut(BaseModel):
     validation_ok: bool | None = None
     needs_review: bool | None = None
     cached: bool | None = None
-    error: str | None = None
+    error: PageErrorOut | None = None
 
 
 class JobStatusOut(BaseModel):
@@ -57,6 +65,7 @@ class EditionSummaryOut(BaseModel):
     article_count: int
     extracted_at: str | None = None
     status: RunStatusValue | None = None
+    failed_pages: list[int] = []
 
 
 class PageStatusOut(BaseModel):
@@ -68,6 +77,12 @@ class EditionDetailOut(EditionSummaryOut):
     pages_with_articles: int
     pages_with_zero_articles: list[int]
     pages: list[PageStatusOut]
+
+
+class DeleteEditionOut(BaseModel):
+    edition: str
+    date: str
+    bytes_freed: int
 
 
 class ArticleOut(BaseModel):
@@ -105,6 +120,7 @@ class PageOut(BaseModel):
     article_count: int
     validation_ok: bool
     coverage_ratio: float | None
+    error: PageErrorOut | None = None
 
 
 class PageArticlesOut(BaseModel):
@@ -127,6 +143,7 @@ class RunSummaryOut(BaseModel):
     total_tokens: int | None
     cache_hit_ratio: float | None
     status: RunStatusValue
+    failed_pages: list[int] = []
 
 
 class StageEventOut(BaseModel):

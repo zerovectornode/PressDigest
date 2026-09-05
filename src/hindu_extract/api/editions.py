@@ -6,11 +6,11 @@ from __future__ import annotations
 
 import json
 
-from hindu_extract import storage
+from hindu_extract import page_errors, storage
 from hindu_extract import trace
 from hindu_extract.api import jobs as jobs_lib
 from hindu_extract.api.edition_id import make_edition_id
-from hindu_extract.api.schemas import EditionDetailOut, EditionSummaryOut, PageStatusOut
+from hindu_extract.api.schemas import EditionDetailOut, EditionSummaryOut, PageErrorOut, PageStatusOut
 from hindu_extract.articles_pipeline import gold_edition_dir
 from hindu_extract.config import Config
 
@@ -81,25 +81,73 @@ def get_page_status(config: Config, edition: str, date: str, page_num: int) -> s
     total = get_total_page_count(config, edition, date)
     if total is None or page_num < 1 or page_num > total:
         return None
-    return "done" if _has_gold(config, edition, date, page_num) else "pending"
+    if _has_gold(config, edition, date, page_num):
+        return "done"
+    if page_errors.read_page_error(config, edition, date, page_num) is not None:
+        return "failed"
+    return "pending"
+
+
+def get_page_error(config: Config, edition: str, date: str, page_num: int) -> PageErrorOut | None:
+    """Prefers the live job's in-memory error (identical content, just
+    avoids a disk read while a job is active) over the persisted
+    error.json - see page_errors.py for why the file is the durable
+    source of truth once the job itself is gone."""
+    active_job = jobs_lib.get_active_job_for_edition(edition, date)
+    if active_job is not None:
+        phase = next((p for p in active_job.per_page if p.page_num == page_num), None)
+        if phase is not None and phase.error is not None:
+            return _to_page_error_out(phase.error)
+        return None
+    error = page_errors.read_page_error(config, edition, date, page_num)
+    return _to_page_error_out(error) if error else None
+
+
+def _to_page_error_out(error: page_errors.PageError) -> PageErrorOut:
+    # Explicit fields, not **error.to_dict() - PageError also carries
+    # failed_at (a persistence-only timestamp), which PageErrorOut doesn't
+    # expose to the frontend.
+    return PageErrorOut(
+        stage=error.stage, code=error.code, message=error.message,
+        attempt_count=error.attempt_count, retryable=error.retryable,
+    )
+
+
+def get_failed_pages(config: Config, edition: str, date: str) -> list[int]:
+    active_job = jobs_lib.get_active_job_for_edition(edition, date)
+    if active_job is not None:
+        return sorted(p.page_num for p in active_job.per_page if p.status == "failed")
+    total = get_total_page_count(config, edition, date)
+    if total is None:
+        return []
+    return sorted(n for n in range(1, total + 1) if page_errors.read_page_error(config, edition, date, n) is not None)
 
 
 def list_editions(config: Config) -> list[EditionSummaryOut]:
     summaries = []
     for edition, date in _iter_edition_date_dirs(config):
-        counts = _page_article_counts(config, edition, date)
-        if not counts:
+        # Existence is "was this edition ever extracted at all" (a
+        # manifest or an active job), not "did at least one page
+        # succeed" - an edition where every page failed still needs to be
+        # visible (and retryable), not silently vanish. error.json is
+        # written under gold_page_dir even for a page that never produced
+        # articles.json, so _iter_edition_date_dirs (which walks gold_root)
+        # still discovers it either way.
+        total = get_total_page_count(config, edition, date)
+        if total is None:
             continue
+        counts = _page_article_counts(config, edition, date)
         latest_run = trace.get_latest_run_for_edition(config.trace_db, edition, date)
         summaries.append(
             EditionSummaryOut(
                 edition_id=make_edition_id(edition, date),
                 edition=edition,
                 date=date,
-                page_count=len(counts),
+                page_count=total,
                 article_count=sum(counts.values()),
                 extracted_at=latest_run["started_at"] if latest_run else None,
                 status=latest_run["status"] if latest_run else None,
+                failed_pages=get_failed_pages(config, edition, date),
             )
         )
     summaries.sort(key=lambda s: s.extracted_at or "", reverse=True)
@@ -107,12 +155,12 @@ def list_editions(config: Config) -> list[EditionSummaryOut]:
 
 
 def get_edition_detail(config: Config, edition: str, date: str) -> EditionDetailOut | None:
-    counts = _page_article_counts(config, edition, date)
-    if not counts:
+    total = get_total_page_count(config, edition, date)
+    if total is None:
         return None
+    counts = _page_article_counts(config, edition, date)
     zero_pages = sorted(page for page, count in counts.items() if count == 0)
     latest_run = trace.get_latest_run_for_edition(config.trace_db, edition, date)
-    total = get_total_page_count(config, edition, date) or len(counts)
     pages = [
         PageStatusOut(page_num=n, status=get_page_status(config, edition, date, n) or "pending")
         for n in range(1, total + 1)
@@ -121,11 +169,12 @@ def get_edition_detail(config: Config, edition: str, date: str) -> EditionDetail
         edition_id=make_edition_id(edition, date),
         edition=edition,
         date=date,
-        page_count=len(counts),
+        page_count=total,
         article_count=sum(counts.values()),
         extracted_at=latest_run["started_at"] if latest_run else None,
         status=latest_run["status"] if latest_run else None,
         pages_with_articles=len(counts) - len(zero_pages),
         pages_with_zero_articles=zero_pages,
         pages=pages,
+        failed_pages=get_failed_pages(config, edition, date),
     )

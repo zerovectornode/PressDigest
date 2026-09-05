@@ -103,6 +103,57 @@ def _process_one_page(
     return page_result_dict, False
 
 
+def _page_outcome(
+    pdf, pdf_hash: str, version_hash: str, edition: str, date: str, page_num: int, config: Config, force: bool,
+    tracer: RunTracer | None,
+) -> PageOutcome:
+    """The per-page work extract_pages loops over, factored out so
+    retry_single_page (a single-page Phase 1 re-run, e.g. after a Phase 2
+    failure elsewhere in the edition) can reuse it without also going
+    through extract_pages's own manifest.json rewrite - see
+    retry_single_page's docstring for why that matters."""
+    page_dict, from_cache = _process_one_page(pdf, pdf_hash, version_hash, page_num, config, force, tracer=tracer)
+    cache_dir = cache.cache_dir_for(config, pdf_hash, version_hash, page_num)
+    dest_dir = storage.bronze_page_dir(config, edition, date, page_num)
+    cache.copy_cache_to(cache_dir, dest_dir)
+
+    line_count = page_dict["metadata"]["line_count"]
+    if line_count == 0:
+        raise EmptyPageError(
+            f"page {page_num} produced zero lines - likely an extraction failure, not a genuine blank page"
+        )
+
+    findings = [CanaryFinding(**f) for f in page_dict["canary_findings"]]
+    metadata = PageMetadata(
+        page_num=page_dict["metadata"]["page_num"],
+        width=page_dict["metadata"]["width"],
+        height=page_dict["metadata"]["height"],
+        modal_font_size=page_dict["metadata"]["modal_font_size"],
+        fonts=tuple(FontInfo(**f) for f in page_dict["metadata"]["fonts"]),
+        char_count=page_dict["metadata"]["char_count"],
+        line_count=line_count,
+    )
+    return PageOutcome(page_num=page_num, metadata=metadata, line_count=line_count, canary_findings=findings, from_cache=from_cache)
+
+
+def retry_single_page(
+    pdf_path: Path, edition: str, date: str, page_num: int, config: Config, tracer: RunTracer | None = None
+) -> PageOutcome:
+    """Re-runs Phase 1 for exactly one page of an already-extracted edition
+    (backs POST /api/editions/{id}/pages/{n}/retry) - reuses the Phase 1
+    cache (keyed on pdf_hash+version_hash+page_num, see cache.py), so a
+    page whose Phase 1 already succeeded returns near-instantly here and
+    this is really just a Phase 2 retry in practice. Deliberately does NOT
+    touch manifest.json the way extract_pages does: that file's page_count
+    describes the whole edition, and a single-page retry must never
+    overwrite it down to page_count=1."""
+    pdf_bytes = Path(pdf_path).read_bytes()
+    pdf_hash = cache.hash_bytes(pdf_bytes)
+    version_hash = cache.hash_text(config.pipeline_version)
+    with pdfplumber.open(pdf_path) as pdf:
+        return _page_outcome(pdf, pdf_hash, version_hash, edition, date, page_num, config, force=False, tracer=tracer)
+
+
 def extract_pages(
     pdf_path: Path,
     edition: str,
@@ -111,6 +162,7 @@ def extract_pages(
     config: Config,
     force: bool = False,
     progress_callback: Callable[[PageOutcome], None] | None = None,
+    error_callback: Callable[[int, Exception], None] | None = None,
     tracer: RunTracer | None = None,
 ) -> list[PageOutcome]:
     """progress_callback, if given, is invoked once per page immediately
@@ -119,7 +171,15 @@ def extract_pages(
     background job runner can report incremental progress without this
     function needing to know anything about jobs. tracer, if given, records
     a char_extraction/line_building/ligature_canary stage event per page -
-    see trace.py."""
+    see trace.py.
+
+    error_callback, if given, isolates one page's failure (a hard canary
+    finding, a corrupt page, EmptyPageError, ...) the same way
+    articles_pipeline.process_edition_articles already isolates a Phase 2
+    failure: that page is skipped (omitted from the returned list) rather
+    than aborting every other page in the edition. Default None reproduces
+    the old behavior (the first bad page kills the whole call) for any
+    caller that hasn't opted in."""
     pdf_bytes = Path(pdf_path).read_bytes()
     pdf_hash = cache.hash_bytes(pdf_bytes)
     version_hash = cache.hash_text(config.pipeline_version)
@@ -127,48 +187,27 @@ def extract_pages(
     outcomes: list[PageOutcome] = []
     with pdfplumber.open(pdf_path) as pdf:
         for page_num in page_nums:
-            page_dict, from_cache = _process_one_page(
-                pdf, pdf_hash, version_hash, page_num, config, force, tracer=tracer
-            )
-            cache_dir = cache.cache_dir_for(config, pdf_hash, version_hash, page_num)
-            dest_dir = storage.bronze_page_dir(config, edition, date, page_num)
-            cache.copy_cache_to(cache_dir, dest_dir)
+            try:
+                outcome = _page_outcome(pdf, pdf_hash, version_hash, edition, date, page_num, config, force, tracer)
+            except Exception as e:  # noqa: BLE001 - a single page's failure must not sink the whole edition
+                if error_callback is None:
+                    raise
+                error_callback(page_num, e)
+                continue
 
-            line_count = page_dict["metadata"]["line_count"]
-            if line_count == 0:
-                raise EmptyPageError(
-                    f"page {page_num} produced zero lines - likely an extraction "
-                    f"failure, not a genuine blank page"
-                )
-
-            findings = [CanaryFinding(**f) for f in page_dict["canary_findings"]]
-            metadata = PageMetadata(
-                page_num=page_dict["metadata"]["page_num"],
-                width=page_dict["metadata"]["width"],
-                height=page_dict["metadata"]["height"],
-                modal_font_size=page_dict["metadata"]["modal_font_size"],
-                fonts=tuple(FontInfo(**f) for f in page_dict["metadata"]["fonts"]),
-                char_count=page_dict["metadata"]["char_count"],
-                line_count=line_count,
-            )
-            outcomes.append(
-                PageOutcome(
-                    page_num=page_num,
-                    metadata=metadata,
-                    line_count=line_count,
-                    canary_findings=findings,
-                    from_cache=from_cache,
-                )
-            )
+            outcomes.append(outcome)
             if progress_callback is not None:
-                progress_callback(outcomes[-1])
+                progress_callback(outcome)
 
     manifest = {
         "edition": edition,
         "date": date,
         "pdf_hash": pdf_hash,
         "pipeline_version": config.pipeline_version,
-        "page_count": len(outcomes),
+        # The full requested page count, not just the pages that succeeded -
+        # editions.get_total_page_count relies on this to know an edition's
+        # true extent even when some pages failed (see error_callback above).
+        "page_count": len(page_nums),
         "pages": [
             {
                 "page_num": o.page_num,

@@ -10,6 +10,11 @@ Type=oneshot
 User=pressdigest
 Group=pressdigest
 Environment=PRESSDIGEST_RETENTION_DAYS=30
+# prune_editions.py now imports hindu_extract.delete_edition (shared with
+# the interactive delete endpoint - see that script's module docstring),
+# so it needs the same PYTHONPATH pressdigest.service uses; it previously
+# didn't need this at all (pure stdlib).
+Environment=PYTHONPATH=/opt/pressdigest/app/src
 ExecStart=/opt/pressdigest/venv/bin/python /opt/pressdigest/app/deploy/prune_editions.py \
     --data-root /var/lib/pressdigest/data \
     --days ${PRESSDIGEST_RETENTION_DAYS}

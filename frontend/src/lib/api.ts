@@ -1,4 +1,5 @@
 import type {
+  DeleteEditionOut,
   EditionDetailOut,
   EditionSummaryOut,
   JobStatusOut,
@@ -70,6 +71,18 @@ export function getPage(editionId: string, pageNum: number): Promise<PageOut> {
 
 export function getPageArticles(editionId: string, pageNum: number): Promise<PageArticlesOut> {
   return request<PageArticlesOut>(`/editions/${editionId}/pages/${pageNum}/articles`)
+}
+
+export function retryPage(editionId: string, pageNum: number): Promise<PageOut> {
+  return request<PageOut>(`/editions/${editionId}/pages/${pageNum}/retry`, { method: 'POST' })
+}
+
+export function retryFailedPages(editionId: string): Promise<StartJobOut> {
+  return request<StartJobOut>(`/editions/${editionId}/retry-failed`, { method: 'POST' })
+}
+
+export function deleteEdition(editionId: string): Promise<DeleteEditionOut> {
+  return request<DeleteEditionOut>(`/editions/${editionId}`, { method: 'DELETE' })
 }
 
 export function listRuns(): Promise<RunSummaryOut[]> {

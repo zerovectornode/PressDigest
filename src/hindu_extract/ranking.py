@@ -222,11 +222,16 @@ def _call_gemini_for_ranking(
 
         from google import genai
         from google.genai import types
-        from hindu_extract.gemini_client import _get_api_key, _generate_with_backoff
+        from hindu_extract.gemini_client import _generate_with_retry, _get_api_key
 
         client = genai.Client(api_key=_get_api_key())
-        response, retry_count = _generate_with_backoff(
+        # page_num=0: ranking's edition-wide sentinel (see trace.py) - reused
+        # here purely for the retry ladder's log/trace messages, not a real page.
+        response = _generate_with_retry(
             client,
+            config,
+            0,
+            detail,
             model=config.ranking.model,
             contents=user_prompt,
             config=types.GenerateContentConfig(
@@ -240,7 +245,6 @@ def _call_gemini_for_ranking(
                 ),
             ),
         )
-        detail["retry_count"] = retry_count
 
         usage = {"cache_hit": False}
         if response.usage_metadata:

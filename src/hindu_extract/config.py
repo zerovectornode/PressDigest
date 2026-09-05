@@ -64,6 +64,18 @@ class ConcurrencyConfig:
 
 
 @dataclass(frozen=True)
+class GeminiRetryConfig:
+    max_attempts: int
+    base_delay_s: float
+    multiplier: float
+    jitter: float
+    max_delay_s: float
+    timeout_s: float
+    quota_retry_after_cap_s: float
+    quota_fallback_delay_s: float
+
+
+@dataclass(frozen=True)
 class RankingConfig:
     model: str
     thinking_level: str
@@ -83,6 +95,7 @@ class Config:
     style: CanaryStyleConfig
     gemini: GeminiConfig
     concurrency: ConcurrencyConfig
+    gemini_retry: GeminiRetryConfig
     ranking: RankingConfig
     project_root: Path
 
@@ -184,5 +197,6 @@ def load_config(path: Path | None = None) -> Config:
         ),
         gemini=GeminiConfig(**raw["gemini"]),
         concurrency=ConcurrencyConfig(**raw["concurrency"]),
+        gemini_retry=GeminiRetryConfig(**raw["gemini_retry"]),
         ranking=RankingConfig(**raw["ranking"]),
     )

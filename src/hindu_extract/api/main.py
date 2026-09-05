@@ -28,10 +28,12 @@ from hindu_extract.api import runs as runs_lib
 from hindu_extract.api.edition_id import InvalidEditionId, split_edition_id
 from hindu_extract.api.metadata_parser import parse_metadata_from_pdf
 from hindu_extract.api.schemas import (
+    DeleteEditionOut,
     EditionDetailOut,
     EditionSummaryOut,
     JobStatusOut,
     PageArticlesOut,
+    PageErrorOut,
     PageOut,
     ParsedMetadataOut,
     PagePhaseOut,
@@ -44,6 +46,7 @@ from hindu_extract.api.schemas import (
     StartJobOut,
 )
 from hindu_extract.config import load_config
+from hindu_extract.delete_edition import delete_edition
 from hindu_extract.storage import raw_pdf_path
 from hindu_extract.trace import RunTracer, new_run_id
 
@@ -202,6 +205,24 @@ async def create_edition(file: UploadFile, edition: str, date: str):
     return StartJobOut(job_id=job_id, edition=edition, date=date)
 
 
+def _page_phase_to_out(p: jobs.PagePhase) -> PagePhaseOut:
+    return PagePhaseOut(
+        page_num=p.page_num,
+        status=p.status,
+        current_stage=p.current_stage,
+        articles_found=p.articles_found,
+        validation_ok=p.validation_ok,
+        needs_review=p.needs_review,
+        cached=p.cached,
+        error=PageErrorOut(
+            stage=p.error.stage, code=p.error.code, message=p.error.message,
+            attempt_count=p.error.attempt_count, retryable=p.error.retryable,
+        )
+        if p.error is not None
+        else None,
+    )
+
+
 def _job_to_status_out(record: jobs.JobRecord) -> JobStatusOut:
     elapsed_s = 0.0
     eta_s = None
@@ -218,7 +239,7 @@ def _job_to_status_out(record: jobs.JobRecord) -> JobStatusOut:
         status=record.status,
         pages_done=record.pages_done,
         pages_total=record.pages_total,
-        per_page=[PagePhaseOut(**vars(p)) for p in record.per_page],
+        per_page=[_page_phase_to_out(p) for p in record.per_page],
         all_cached=record.all_cached,
         error=record.error,
         elapsed_s=elapsed_s,
@@ -290,6 +311,7 @@ async def get_page_route(edition_id: str, page_num: int):
             article_count=0,
             validation_ok=False,
             coverage_ratio=None,
+            error=editions_lib.get_page_error(config, edition, date, page_num) if status == "failed" else None,
         )
     return pages_lib.get_page(config, edition, date, page_num)
 
@@ -307,6 +329,67 @@ async def get_page_articles_route(edition_id: str, page_num: int):
         return PageArticlesOut(status=status, articles=[])
     articles = pages_lib.get_page_articles(config, edition, date, page_num) or []
     return PageArticlesOut(status="done", articles=articles)
+
+
+# Plain `def`, not `async def` - retry_page_sync makes a synchronous,
+# possibly slow Gemini call; see trigger_ranking_route above for why this
+# is safe (FastAPI runs it in a worker thread automatically).
+@app.post("/api/editions/{edition_id}/pages/{page_num}/retry", response_model=PageOut)
+def retry_page_route(edition_id: str, page_num: int):
+    try:
+        edition, date = split_edition_id(edition_id)
+    except InvalidEditionId as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    status = editions_lib.get_page_status(config, edition, date, page_num)
+    if status is None:
+        raise HTTPException(status_code=404, detail=f"no page {page_num} for edition {edition_id!r}")
+    if jobs.get_active_job_for_edition(edition, date) is not None:
+        raise HTTPException(status_code=409, detail=f"an extraction is already running for {edition_id!r}")
+
+    jobs.retry_page_sync(config, edition, date, page_num)
+
+    new_status = editions_lib.get_page_status(config, edition, date, page_num)
+    if new_status == "done":
+        return pages_lib.get_page(config, edition, date, page_num)
+    return PageOut(
+        page_num=page_num, status=new_status or "pending", width=None, height=None, line_count=None,
+        article_count=0, validation_ok=False, coverage_ratio=None,
+        error=editions_lib.get_page_error(config, edition, date, page_num),
+    )
+
+
+@app.post("/api/editions/{edition_id}/retry-failed", response_model=StartJobOut)
+async def retry_failed_pages_route(edition_id: str):
+    try:
+        edition, date = split_edition_id(edition_id)
+    except InvalidEditionId as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if jobs.get_active_job_for_edition(edition, date) is not None:
+        raise HTTPException(status_code=409, detail=f"an extraction is already running for {edition_id!r}")
+    failed_pages = editions_lib.get_failed_pages(config, edition, date)
+    if not failed_pages:
+        raise HTTPException(status_code=404, detail=f"no failed pages for edition {edition_id!r}")
+
+    job_id = jobs.start_retry_job(edition, date, failed_pages, config)
+    return StartJobOut(job_id=job_id, edition=edition, date=date)
+
+
+@app.delete("/api/editions/{edition_id}", response_model=DeleteEditionOut)
+async def delete_edition_route(edition_id: str):
+    try:
+        edition, date = split_edition_id(edition_id)
+    except InvalidEditionId as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if editions_lib.get_total_page_count(config, edition, date) is None:
+        raise HTTPException(status_code=404, detail=f"no edition {edition_id!r}")
+    if jobs.get_active_job_for_edition(edition, date) is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"an extraction is currently running for {edition_id!r} - wait for it to finish or fail before deleting",
+        )
+
+    result = delete_edition(config, edition, date)
+    return DeleteEditionOut(edition=result.edition, date=result.date, bytes_freed=result.bytes_freed)
 
 
 # --- Step D: pipeline monitoring ("Pipeline" view) --------------------------

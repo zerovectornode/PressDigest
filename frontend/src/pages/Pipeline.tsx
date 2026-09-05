@@ -8,6 +8,7 @@ function statusBadge(status: string): string {
   switch (status) {
     case 'done':
       return 'bg-teal-50 text-teal-700'
+    case 'completed_with_errors':
     case 'failed':
       return 'bg-rose-50 text-rose-700'
     default:
@@ -100,8 +101,13 @@ function RunList() {
             </td>
             <td className="py-2 pr-4">
               <span className={`rounded-full px-2 py-0.5 text-xs font-medium ${statusBadge(run.status)}`}>
-                {run.status}
+                {run.status.replace(/_/g, ' ')}
               </span>
+              {(run.failed_pages ?? []).length > 0 && (
+                <span className="ml-2 text-xs text-rose-500">
+                  page{run.failed_pages!.length === 1 ? '' : 's'} {run.failed_pages!.join(', ')}
+                </span>
+              )}
             </td>
           </tr>
         ))}

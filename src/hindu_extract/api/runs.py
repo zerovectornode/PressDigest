@@ -9,7 +9,7 @@ from hindu_extract.config import Config
 from hindu_extract import trace
 
 
-def _to_run_summary(row: dict) -> RunSummaryOut:
+def _to_run_summary(config: Config, row: dict) -> RunSummaryOut:
     return RunSummaryOut(
         run_id=row["run_id"],
         edition=row["edition"],
@@ -22,11 +22,12 @@ def _to_run_summary(row: dict) -> RunSummaryOut:
         total_tokens=row["total_tokens"],
         cache_hit_ratio=row["cache_hit_ratio"],
         status=row["status"],
+        failed_pages=trace.get_failed_pages_for_run(config.trace_db, row["run_id"]),
     )
 
 
 def list_runs(config: Config) -> list[RunSummaryOut]:
-    return [_to_run_summary(r) for r in trace.list_runs(config.trace_db)]
+    return [_to_run_summary(config, r) for r in trace.list_runs(config.trace_db)]
 
 
 def get_run(config: Config, run_id: str) -> RunDetailOut | None:
@@ -34,7 +35,7 @@ def get_run(config: Config, run_id: str) -> RunDetailOut | None:
     if row is None:
         return None
     pages = trace.get_run_pages(config.trace_db, run_id)
-    return RunDetailOut(**_to_run_summary(row).model_dump(), pages=pages)
+    return RunDetailOut(**_to_run_summary(config, row).model_dump(), pages=pages)
 
 
 def get_page_stages(config: Config, run_id: str, page_num: int) -> list[StageEventOut]:

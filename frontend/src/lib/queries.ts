@@ -12,7 +12,7 @@ export function useCreateEdition() {
   })
 }
 
-const TERMINAL_JOB_STATUSES = new Set(['done', 'failed'])
+const TERMINAL_JOB_STATUSES = new Set(['done', 'completed_with_errors', 'failed'])
 
 export function useJobStatus(jobId: string | null) {
   const queryClient = useQueryClient()
@@ -80,11 +80,42 @@ export function usePageArticles(editionId: string | undefined, pageNum: number |
   })
 }
 
+/** Retries one page in place - the mutation itself blocks until the retry
+ * finishes (see main.py's sync retry_page_route), so on success we just
+ * push the fresh PageOut straight into the cache rather than re-fetching. */
+export function useRetryPage(editionId: string | undefined) {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (pageNum: number) => api.retryPage(editionId!, pageNum),
+    onSuccess: (page, pageNum) => {
+      queryClient.setQueryData(['page', editionId, pageNum], page)
+      queryClient.invalidateQueries({ queryKey: ['page-articles', editionId, pageNum] })
+      queryClient.invalidateQueries({ queryKey: ['edition', editionId] })
+      queryClient.invalidateQueries({ queryKey: ['editions'] })
+    },
+  })
+}
+
+/** Bulk "retry N failed pages" - this one starts a background job (see
+ * jobs.start_retry_job), so the caller feeds the returned job_id into the
+ * same useJobStatus/ProgressPanel machinery a fresh extraction uses. */
+export function useRetryFailedPages(editionId: string | undefined) {
+  return useMutation({ mutationFn: () => api.retryFailedPages(editionId!) })
+}
+
+export function useDeleteEdition() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (editionId: string) => api.deleteEdition(editionId),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['editions'] }),
+  })
+}
+
 export function useRuns() {
   return useQuery({ queryKey: ['runs'], queryFn: api.listRuns, refetchInterval: 5000 })
 }
 
-const TERMINAL_RUN_STATUSES = new Set(['done', 'failed'])
+const TERMINAL_RUN_STATUSES = new Set(['done', 'completed_with_errors', 'failed'])
 
 export function useRun(runId: string | undefined) {
   return useQuery({

@@ -3,10 +3,11 @@ import { useNavigate, useParams } from 'react-router-dom'
 import { useQueryClient } from '@tanstack/react-query'
 import { ArticleCard } from '../components/ArticleCard'
 import { EmptyState } from '../components/EmptyState'
+import { FailedPageState } from '../components/FailedPageState'
 import { PdfPageCanvas, type PdfHighlight } from '../components/PdfPageCanvas'
 import * as api from '../lib/api'
 import { editionPdfUrl } from '../lib/api'
-import { useEdition, usePage, usePageArticles } from '../lib/queries'
+import { useEdition, usePage, usePageArticles, useRetryPage } from '../lib/queries'
 
 // Above this many articles on one page, only render the first N up front -
 // real pages in this dataset (docs/Newspaper.pdf) never come close (page 1
@@ -34,6 +35,8 @@ export function PageReader() {
   const editionQuery = useEdition(editionId)
   const pageQuery = usePage(editionId, pageNum)
   const articlesQuery = usePageArticles(editionId, pageNum)
+  const retryPage = useRetryPage(editionId)
+  const redirectedForEditionRef = useRef<string | undefined>(undefined)
 
   // Prefetch the next page's articles + let the browser cache the next
   // page's PDF render on idle, so turning the page doesn't re-block on a
@@ -92,6 +95,26 @@ export function PageReader() {
     }
   }, [])
 
+  // Redirects once per edition, on landing only: if the page the user
+  // arrived on (e.g. "Start reading page 1" when page 1 happens to have
+  // failed) isn't done yet, jump straight to the first page that is -
+  // this is what turns a dead end into a working reader. Marks the
+  // edition as "handled" either way so normal Prev/Next/retry navigation
+  // afterward is never fought by this effect.
+  useEffect(() => {
+    if (!editionId || pageNum === undefined) return
+    if (redirectedForEditionRef.current === editionId) return
+    const pages = editionQuery.data?.pages
+    if (!pages) return
+    redirectedForEditionRef.current = editionId
+    const currentStatus = pages.find((p) => p.page_num === pageNum)?.status
+    if (currentStatus === 'done') return
+    const firstAvailable = pages.find((p) => p.status === 'done')?.page_num
+    if (firstAvailable !== undefined && firstAvailable !== pageNum) {
+      navigate(`/reader/${editionId}/${firstAvailable}`, { replace: true })
+    }
+  }, [editionId, pageNum, editionQuery.data, navigate])
+
   if (!editionId || pageNum === undefined) {
     return (
       <EmptyState
@@ -140,16 +163,26 @@ export function PageReader() {
     )
   }
 
+  if (pageQuery.data.status === 'failed') {
+    const forwardAvailable = pageStatuses?.find((p) => p.page_num > pageNum && p.status === 'done')?.page_num
+    const anyAvailable = pageStatuses?.find((p) => p.status === 'done')?.page_num
+    return (
+      <FailedPageState
+        editionId={editionId}
+        pageNum={pageNum}
+        error={pageQuery.data.error ?? null}
+        nextAvailablePage={forwardAvailable ?? anyAvailable ?? null}
+        onRetry={() => retryPage.mutate(pageNum)}
+        retrying={retryPage.isPending}
+      />
+    )
+  }
+
   if (pageQuery.data.status !== 'done') {
-    const stillFailed = pageQuery.data.status === 'failed'
     return (
       <EmptyState
-        title={stillFailed ? `Page ${pageNum} failed to extract` : `Page ${pageNum} is still being extracted`}
-        description={
-          stillFailed
-            ? 'Extraction hit an error on this page - check the Pipeline view for details.'
-            : "This page hasn't finished extraction yet - this'll update automatically once it's done."
-        }
+        title={`Page ${pageNum} is still being extracted`}
+        description="This page hasn't finished extraction yet - this'll update automatically once it's done."
         linkTo="/"
         linkLabel="Go to Home"
       />

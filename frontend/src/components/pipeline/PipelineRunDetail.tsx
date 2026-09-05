@@ -1,8 +1,27 @@
 import { useState } from 'react'
 import { Link } from 'react-router-dom'
+import { makeEditionId } from '../../lib/api'
 import { formatTimestamp, runType } from '../../lib/format'
-import { useRun, useRunPageRaw, useRunPagesStages } from '../../lib/queries'
+import { useRetryFailedPages, useRun, useRunPageRaw, useRunPagesStages } from '../../lib/queries'
 import type { StageEventOut } from '../../types/api'
+
+function RetryFailedPagesButton({ edition, date, failedPages }: { edition: string; date: string; failedPages: number[] }) {
+  const editionId = makeEditionId(edition, date)
+  const retryFailed = useRetryFailedPages(editionId)
+  return (
+    <button
+      onClick={() => retryFailed.mutate()}
+      disabled={retryFailed.isPending}
+      className="rounded-md border border-rose-300 bg-white px-2 py-1 text-xs font-medium text-rose-700 hover:bg-rose-50 disabled:cursor-not-allowed disabled:opacity-50"
+    >
+      {retryFailed.isPending
+        ? 'Retrying...'
+        : retryFailed.isSuccess
+          ? 'Retrying in background...'
+          : `Retry ${failedPages.length} failed page${failedPages.length === 1 ? '' : 's'}`}
+    </button>
+  )
+}
 
 // Matches trace.py's STAGE_NAMES for the per-page stages (ranking is
 // edition-wide, handled separately - see isRankingRun below). No
@@ -52,6 +71,12 @@ function StageTimelineTab({ pages, stagesByPage }: { pages: number[]; stagesByPa
         const events = stagesByPage[pageNum] ?? []
         const byStage = eventsByStage(events)
         const total = events.reduce((sum, e) => sum + e.duration_s, 0) || 1
+        // Surfaces retry cost specifically, not just total duration - a
+        // page that took 40s because it retried three times looks very
+        // different from one that took 40s because Gemini was just slow,
+        // and the segment width alone can't tell the two apart.
+        const geminiDetail = byStage['gemini_call']?.detail as { attempt_count?: number; sleep_total_s?: number } | undefined
+        const attemptCount = geminiDetail?.attempt_count ?? 1
         return (
           <div key={pageNum} className="flex items-center gap-3">
             <span className="w-16 shrink-0 text-xs text-slate-500">page {pageNum}</span>
@@ -60,16 +85,35 @@ function StageTimelineTab({ pages, stagesByPage }: { pages: number[]; stagesByPa
                 const e = byStage[stage]
                 if (!e) return null
                 const widthPct = (e.duration_s / total) * 100
+                const detail = e.detail as { attempts?: Array<{ error_message?: string | null }> } | undefined
+                const attemptErrors = (detail?.attempts ?? [])
+                  .map((a) => a.error_message)
+                  .filter((m): m is string => Boolean(m))
+                const tooltip = [
+                  `${stage}: ${e.duration_s.toFixed(2)}s`,
+                  e.error ? `ERROR: ${e.error}` : null,
+                  attemptErrors.length > 0 ? `failed attempts: ${attemptErrors.join(' | ')}` : null,
+                ]
+                  .filter(Boolean)
+                  .join(' - ')
                 return (
                   <div
                     key={stage}
-                    title={`${stage}: ${e.duration_s.toFixed(2)}s${e.error ? ` - ERROR: ${e.error}` : ''}`}
+                    title={tooltip}
                     className={`${STAGE_COLOR[stage]} ${e.error ? 'ring-2 ring-inset ring-rose-600' : ''} h-full`}
                     style={{ width: `${widthPct}%` }}
                   />
                 )
               })}
             </div>
+            {attemptCount > 1 && (
+              <span
+                title={`Gemini call took ${attemptCount} attempts (${(geminiDetail?.sleep_total_s ?? 0).toFixed(1)}s spent sleeping between retries)`}
+                className="shrink-0 rounded-full bg-amber-100 px-1.5 py-0.5 text-xs font-medium text-amber-700"
+              >
+                {attemptCount} attempts
+              </span>
+            )}
             <span className="w-14 shrink-0 text-right text-xs text-slate-400">{total.toFixed(2)}s</span>
           </div>
         )
@@ -317,11 +361,18 @@ export function PipelineRunDetail({ runId }: { runId: string }) {
           </span>
           <span
             className={`rounded-full px-2 py-0.5 text-xs font-medium ${
-              run.status === 'done' ? 'bg-teal-50 text-teal-700' : run.status === 'failed' ? 'bg-rose-50 text-rose-700' : 'bg-amber-50 text-amber-700'
+              run.status === 'done'
+                ? 'bg-teal-50 text-teal-700'
+                : run.status === 'completed_with_errors' || run.status === 'failed'
+                  ? 'bg-rose-50 text-rose-700'
+                  : 'bg-amber-50 text-amber-700'
             }`}
           >
-            {run.status}
+            {run.status.replace(/_/g, ' ')}
           </span>
+          {(run.failed_pages ?? []).length > 0 && (
+            <RetryFailedPagesButton edition={run.edition} date={run.date} failedPages={run.failed_pages ?? []} />
+          )}
         </div>
       </div>
 

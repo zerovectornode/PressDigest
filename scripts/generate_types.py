@@ -25,12 +25,14 @@ TMP_DIR = PROJECT_ROOT / "scripts" / "_generated_schemas"
 
 MODELS = [
     schemas.ParsedMetadataOut,
+    schemas.PageErrorOut,
     schemas.PagePhaseOut,
     schemas.JobStatusOut,
     schemas.StartJobOut,
     schemas.EditionSummaryOut,
     schemas.EditionDetailOut,
     schemas.PageStatusOut,
+    schemas.DeleteEditionOut,
     schemas.ArticleOut,
     schemas.PageOut,
     schemas.PageArticlesOut,

@@ -251,6 +251,44 @@ def get_page_stages(db_path: Path, run_id: str, page_num: int) -> list[dict]:
     return out
 
 
+def delete_runs_for_edition(db_path: Path, edition: str, date: str) -> int:
+    """Deletes every run (and its stage_events/gemini_raw rows) recorded
+    for this edition+date - used by delete_edition.py. Children first
+    (stage_events/gemini_raw reference run_id; SQLite doesn't enforce the
+    FOREIGN KEY declared in _SCHEMA by default, but deleting in this order
+    is correct regardless). Returns the number of run rows removed."""
+    conn = _get_connection(db_path)
+    with _lock:
+        run_ids = [
+            r["run_id"]
+            for r in conn.execute("SELECT run_id FROM runs WHERE edition = ? AND date = ?", (edition, date)).fetchall()
+        ]
+        if not run_ids:
+            return 0
+        placeholders = ",".join("?" * len(run_ids))
+        conn.execute(f"DELETE FROM gemini_raw WHERE run_id IN ({placeholders})", run_ids)
+        conn.execute(f"DELETE FROM stage_events WHERE run_id IN ({placeholders})", run_ids)
+        conn.execute(f"DELETE FROM runs WHERE run_id IN ({placeholders})", run_ids)
+        conn.commit()
+        return len(run_ids)
+
+
+def get_failed_pages_for_run(db_path: Path, run_id: str) -> list[int]:
+    """Derived from stage_events rather than stored on the run itself - a
+    stage_events row always records `error` (even for a stage that later
+    got retried and succeeded on the trace's own attempt loop - see
+    gemini_client._generate_with_retry, which only writes a stage_events
+    row once, for the final outcome), so a page that ultimately failed is
+    exactly the set of page_nums with at least one errored stage event for
+    this run. No schema change needed - see design/DESIGN.md."""
+    conn = _get_connection(db_path)
+    rows = conn.execute(
+        "SELECT DISTINCT page_num FROM stage_events WHERE run_id = ? AND error IS NOT NULL ORDER BY page_num",
+        (run_id,),
+    ).fetchall()
+    return [r["page_num"] for r in rows]
+
+
 def get_run_pages(db_path: Path, run_id: str) -> list[int]:
     conn = _get_connection(db_path)
     rows = conn.execute(

@@ -197,6 +197,52 @@ concurrency:
   # (7,147) with margin for pages with more lines/articles than page 1.
   estimated_tokens_per_request: 12000
 
+# Transport-layer retry for a single Gemini call (gemini_client.py), covering both
+# Phase 2's page calls and Phase 4's ranking call - see design/DESIGN.md "Gemini retry
+# policy" for the 2026-09-04 503 incident (run c5124271) that prompted this: page 1
+# failed after 7.73s with zero retries, and the failure was then unrecoverable in the
+# reader (see "Page failure state model" in the same doc).
+gemini_retry:
+  # 1 initial attempt + 3 retries - enough to ride out a multi-minute demand spike
+  # (the incident's 503 was transient, not persistent) without one page blocking an
+  # otherwise-fine 20-page edition indefinitely.
+  max_attempts: 4
+
+  # First retry waits ~4s - long enough that a transient 503/500/504 has a real chance
+  # to have cleared server-side before we ask again.
+  base_delay_s: 4.0
+
+  # Nominal ladder is base_delay_s * multiplier**attempt = 4s, 8s, 16s.
+  multiplier: 2.0
+
+  # Actual sleep = uniform(0.5x, 1.5x) of the nominal delay above. Matters specifically
+  # because production Phase 2 concurrency is 2 (HINDU_EXTRACT_MAX_CONCURRENT=2) -
+  # un-jittered retries would land two concurrent workers back into the same demand
+  # spike in lockstep, repeatedly.
+  jitter: 0.5
+
+  # Caps the ladder so a page never waits longer than this between attempts, even if
+  # the nominal exponential value would be larger.
+  max_delay_s: 30.0
+
+  # Per-attempt call timeout via the SDK's own types.HttpOptions(timeout=...), not a
+  # hand-rolled thread timeout. Well above the ~9-10s MEDIUM-thinking baseline (see
+  # concurrency's calibration note above) - only fires for a genuinely hung connection,
+  # which then counts as a retryable failure like any other transient error.
+  timeout_s: 120.0
+
+  # 429 RESOURCE_EXHAUSTED is a separate path, not the ladder above (see
+  # gemini_client.py) - 21 calls/edition at concurrency 2 against 15 RPM / 250K TPM
+  # makes RPM/TPM exhaustion implausible, so a 429 is far more likely the daily (RPD)
+  # cap, which is not worth retrying against (see quota_fallback_delay_s below and the
+  # RPD fail-fast check in code). When the API does give a retry-after/RetryInfo hint,
+  # honour it but never wait longer than this.
+  quota_retry_after_cap_s: 90.0
+
+  # No retry-after hint given: wait this long (one RPM window) before the single
+  # allowed 429 retry.
+  quota_fallback_delay_s: 60.0
+
 ranking:
   # Edition-wide importance ranking - a single call across every article on
   # every page, not per-page (per-page scores aren't comparable to each

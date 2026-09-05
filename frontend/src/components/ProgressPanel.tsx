@@ -46,6 +46,7 @@ export function ProgressPanel({ job }: { job: JobStatusOut }) {
   // stalled.
   const inFlight = job.per_page.filter((p) => p.status === 'extracting' || p.status === 'grouping')
   const articleCount = job.per_page.reduce((sum, p) => sum + (p.articles_found ?? 0), 0)
+  const failedPages = job.per_page.filter((p) => p.status === 'failed')
   const failures = job.per_page.filter((p) => p.status === 'failed' || p.validation_ok === false)
 
   return (
@@ -54,9 +55,11 @@ export function ProgressPanel({ job }: { job: JobStatusOut }) {
         <span className="text-sm font-medium text-slate-700">
           {job.status === 'done'
             ? `Done - ${job.pages_total} page${job.pages_total === 1 ? '' : 's'} processed`
-            : job.status === 'failed'
-              ? 'Job failed'
-              : `${job.pages_done} of ${job.pages_total || '?'} pages done`}
+            : job.status === 'completed_with_errors'
+              ? `Completed with errors - ${failedPages.length} of ${job.pages_total} page${job.pages_total === 1 ? '' : 's'} failed`
+              : job.status === 'failed'
+                ? 'Job failed'
+                : `${job.pages_done} of ${job.pages_total || '?'} pages done`}
         </span>
         <span className="text-sm text-slate-500">{articleCount} article{articleCount === 1 ? '' : 's'} found</span>
       </div>
@@ -88,7 +91,7 @@ export function ProgressPanel({ job }: { job: JobStatusOut }) {
         {job.per_page.map((p) => (
           <div
             key={p.page_num}
-            title={`page ${p.page_num}: ${p.status}${p.error ? ` - ${p.error}` : ''}`}
+            title={`page ${p.page_num}: ${p.status}${p.error ? ` - ${p.error.stage}: ${p.error.message}` : ''}`}
             className={`h-3 w-3 rounded-sm ${statusColor(p.status)}`}
           />
         ))}
@@ -103,7 +106,7 @@ export function ProgressPanel({ job }: { job: JobStatusOut }) {
           </span>
           {failures.map((p) => (
             <span key={p.page_num}>
-              page {p.page_num}: {p.error ?? (p.validation_ok === false ? 'boundary validation failed' : p.status)}
+              page {p.page_num}: {p.error ? `${p.error.stage}: ${p.error.message}` : p.validation_ok === false ? 'boundary validation failed' : p.status}
             </span>
           ))}
         </div>

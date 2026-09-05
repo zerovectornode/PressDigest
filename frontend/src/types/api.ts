@@ -11,6 +11,15 @@ export interface ParsedMetadataOut {
   [k: string]: unknown;
 }
 
+export interface PageErrorOut {
+  stage: string;
+  code: string | number | null;
+  message: string;
+  attempt_count: number;
+  retryable: boolean;
+  [k: string]: unknown;
+}
+
 export interface PagePhaseOut {
   page_num: number;
   status: "pending" | "extracting" | "grouping" | "done" | "failed";
@@ -19,15 +28,16 @@ export interface PagePhaseOut {
   validation_ok?: boolean | null;
   needs_review?: boolean | null;
   cached?: boolean | null;
-  error?: string | null;
+  error?: PageErrorOut | null;
   [k: string]: unknown;
 }
+
 
 export interface JobStatusOut {
   job_id: string;
   edition: string;
   date: string;
-  status: "queued" | "running" | "done" | "failed";
+  status: "queued" | "running" | "done" | "completed_with_errors" | "failed";
   pages_done: number;
   pages_total: number;
   per_page: PagePhaseOut[];
@@ -37,6 +47,7 @@ export interface JobStatusOut {
   eta_s?: number | null;
   [k: string]: unknown;
 }
+
 
 
 export interface StartJobOut {
@@ -53,7 +64,8 @@ export interface EditionSummaryOut {
   page_count: number;
   article_count: number;
   extracted_at?: string | null;
-  status?: ("running" | "done" | "failed") | null;
+  status?: ("running" | "done" | "completed_with_errors" | "failed") | null;
+  failed_pages?: number[];
   [k: string]: unknown;
 }
 
@@ -64,7 +76,8 @@ export interface EditionDetailOut {
   page_count: number;
   article_count: number;
   extracted_at?: string | null;
-  status?: ("running" | "done" | "failed") | null;
+  status?: ("running" | "done" | "completed_with_errors" | "failed") | null;
+  failed_pages?: number[];
   pages_with_articles: number;
   pages_with_zero_articles: number[];
   pages: PageStatusOut[];
@@ -77,6 +90,13 @@ export interface PageStatusOut {
 }
 
 
+
+export interface DeleteEditionOut {
+  edition: string;
+  date: string;
+  bytes_freed: number;
+  [k: string]: unknown;
+}
 
 export interface ArticleOut {
   article_id: string;
@@ -114,8 +134,10 @@ export interface PageOut {
   article_count: number;
   validation_ok: boolean;
   coverage_ratio: number | null;
+  error?: PageErrorOut | null;
   [k: string]: unknown;
 }
+
 
 export interface PageArticlesOut {
   status: "pending" | "in_progress" | "done" | "failed";
@@ -135,7 +157,8 @@ export interface RunSummaryOut {
   total_wall_clock_s: number | null;
   total_tokens: number | null;
   cache_hit_ratio: number | null;
-  status: "running" | "done" | "failed";
+  status: "running" | "done" | "completed_with_errors" | "failed";
+  failed_pages?: number[];
   [k: string]: unknown;
 }
 
@@ -163,7 +186,8 @@ export interface RunDetailOut {
   total_wall_clock_s: number | null;
   total_tokens: number | null;
   cache_hit_ratio: number | null;
-  status: "running" | "done" | "failed";
+  status: "running" | "done" | "completed_with_errors" | "failed";
+  failed_pages?: number[];
   pages: number[];
   [k: string]: unknown;
 }
