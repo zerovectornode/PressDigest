@@ -2,6 +2,7 @@ import { Link, useParams } from 'react-router-dom'
 import { EmptyState } from '../components/EmptyState'
 import { PipelineRunDetail } from '../components/pipeline/PipelineRunDetail'
 import { formatTimestamp, runType } from '../lib/format'
+import { useDocumentTitle } from '../lib/useDocumentTitle'
 import { useQuota, useRuns } from '../lib/queries'
 
 function statusBadge(status: string): string {
@@ -64,8 +65,16 @@ function RunList() {
   }
 
   return (
-    <table className="w-full text-left text-sm">
-      <thead>
+    // The run table has nine columns - squashing them to fit a phone
+    // screen would make every one unreadable, so it scrolls horizontally
+    // instead, with a "scroll for more →" hint on mobile as the visible
+    // affordance (md:hidden - desktop already sees the whole table with
+    // room to spare, so it'd otherwise never trigger this scroll at all).
+    <div>
+      <p className="mb-1 text-xs text-slate-400 md:hidden">Scroll for more →</p>
+      <div className="overflow-x-auto">
+        <table className="w-full min-w-[720px] text-left text-sm">
+          <thead>
         <tr className="border-b border-slate-200 text-xs uppercase tracking-wide text-slate-400">
           <th className="py-2 pr-4">Started</th>
           <th className="py-2 pr-4">Run</th>
@@ -111,16 +120,19 @@ function RunList() {
             </td>
           </tr>
         ))}
-      </tbody>
-    </table>
+        </tbody>
+        </table>
+      </div>
+    </div>
   )
 }
 
 export function Pipeline() {
   const { runId } = useParams<{ runId: string }>()
+  useDocumentTitle(runId ? `Run ${runId.slice(0, 8)} — Pipeline` : 'Pipeline')
 
   return (
-    <div className="mx-auto flex max-w-5xl flex-col gap-8 px-8 py-10">
+    <div className="mx-auto flex max-w-5xl flex-col gap-8 px-4 py-10 md:px-8">
       <div>
         <h1 className="text-2xl font-semibold text-slate-900">Pipeline</h1>
         <p className="mt-1 text-sm text-slate-500">

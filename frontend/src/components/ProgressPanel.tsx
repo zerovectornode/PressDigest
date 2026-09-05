@@ -51,7 +51,7 @@ export function ProgressPanel({ job }: { job: JobStatusOut }) {
 
   return (
     <div className="flex flex-col gap-4 rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
-      <div className="flex items-center justify-between">
+      <div className="flex flex-wrap items-center justify-between gap-2">
         <span className="text-sm font-medium text-slate-700">
           {job.status === 'done'
             ? `Done - ${job.pages_total} page${job.pages_total === 1 ? '' : 's'} processed`

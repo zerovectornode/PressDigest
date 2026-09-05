@@ -34,18 +34,17 @@ function EditionRow({ edition }: { edition: EditionSummaryOut }) {
 
   return (
     <li className="flex flex-col gap-2 rounded-xl border border-slate-200 bg-white px-4 py-3 shadow-sm">
-      <div className="flex items-center justify-between">
-        <Link
-          to={`/reader/${edition.edition_id}/1`}
-          className="flex flex-1 items-center justify-between transition-colors hover:text-teal-700"
-        >
-          <div>
-            <p className="font-medium capitalize text-slate-800">{edition.edition}</p>
-            <p className="text-xs text-slate-500">{edition.date}</p>
-            {edition.extracted_at && (
-              <p className="text-xs text-slate-400">extracted {formatTimestamp(edition.extracted_at)}</p>
-            )}
-          </div>
+      {/* flex-wrap lets the counts/status/delete cluster drop to its own
+          line at narrow widths instead of squeezing six pieces of
+          information into one unbreakable row (see design/DESIGN.md
+          mobile layout notes). */}
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <Link to={`/reader/${edition.edition_id}/1`} className="min-w-0 transition-colors hover:text-teal-700">
+          <p className="font-medium capitalize text-slate-800">{edition.edition}</p>
+          <p className="text-xs text-slate-500">{edition.date}</p>
+          {edition.extracted_at && (
+            <p className="text-xs text-slate-400">extracted {formatTimestamp(edition.extracted_at)}</p>
+          )}
         </Link>
         <div className="flex items-center gap-3">
           <div className="text-right text-xs text-slate-500">
@@ -60,7 +59,7 @@ function EditionRow({ edition }: { edition: EditionSummaryOut }) {
           <button
             onClick={() => setConfirming(true)}
             title="Delete this edition"
-            className="rounded-md border border-slate-200 px-2 py-1 text-xs text-slate-500 hover:border-rose-300 hover:text-rose-600"
+            className="flex min-h-11 min-w-11 items-center justify-center rounded-md border border-slate-200 px-2 py-1 text-xs text-slate-500 hover:border-rose-300 hover:text-rose-600"
           >
             Delete
           </button>
@@ -68,7 +67,7 @@ function EditionRow({ edition }: { edition: EditionSummaryOut }) {
       </div>
 
       {failedPages.length > 0 && (
-        <div className="flex items-center justify-between rounded-lg bg-rose-50 px-3 py-2 text-xs text-rose-700">
+        <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg bg-rose-50 px-3 py-2 text-xs text-rose-700">
           <span>
             {failedPages.length} page{failedPages.length === 1 ? '' : 's'} failed: page{' '}
             {failedPages.join(', ')}
@@ -76,7 +75,7 @@ function EditionRow({ edition }: { edition: EditionSummaryOut }) {
           <button
             onClick={() => retryFailed.mutate()}
             disabled={retryFailed.isPending}
-            className="rounded-md border border-rose-300 bg-white px-2 py-1 font-medium text-rose-700 hover:bg-rose-100 disabled:cursor-not-allowed disabled:opacity-50"
+            className="min-h-11 rounded-md border border-rose-300 bg-white px-2 py-1 font-medium text-rose-700 hover:bg-rose-100 disabled:cursor-not-allowed disabled:opacity-50"
           >
             {retryFailed.isPending
               ? 'Retrying...'
@@ -96,17 +95,17 @@ function EditionRow({ edition }: { edition: EditionSummaryOut }) {
             its stored PDF, extracted text, and articles - the Gemini response cache is kept, so re-extracting the
             same PDF later stays free.
           </p>
-          <div className="flex gap-2">
+          <div className="flex flex-wrap gap-2">
             <button
               onClick={handleDelete}
               disabled={deleteEdition.isPending}
-              className="rounded-md bg-rose-600 px-3 py-1 font-medium text-white hover:bg-rose-700 disabled:cursor-not-allowed disabled:opacity-50"
+              className="min-h-11 rounded-md bg-rose-600 px-3 py-1 font-medium text-white hover:bg-rose-700 disabled:cursor-not-allowed disabled:opacity-50"
             >
               {deleteEdition.isPending ? 'Deleting...' : 'Confirm delete'}
             </button>
             <button
               onClick={() => setConfirming(false)}
-              className="rounded-md border border-slate-300 bg-white px-3 py-1 font-medium text-slate-600 hover:bg-slate-50"
+              className="min-h-11 rounded-md border border-slate-300 bg-white px-3 py-1 font-medium text-slate-600 hover:bg-slate-50"
             >
               Cancel
             </button>

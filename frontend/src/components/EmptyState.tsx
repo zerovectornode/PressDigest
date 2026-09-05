@@ -22,7 +22,7 @@ export function EmptyState({
       {linkTo && linkLabel && (
         <Link
           to={linkTo}
-          className="mt-2 rounded-lg bg-teal-600 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-teal-700"
+          className="mt-2 inline-flex min-h-11 items-center rounded-lg bg-teal-600 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-teal-700"
         >
           {linkLabel}
         </Link>

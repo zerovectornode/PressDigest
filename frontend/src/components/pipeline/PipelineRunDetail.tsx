@@ -12,7 +12,7 @@ function RetryFailedPagesButton({ edition, date, failedPages }: { edition: strin
     <button
       onClick={() => retryFailed.mutate()}
       disabled={retryFailed.isPending}
-      className="rounded-md border border-rose-300 bg-white px-2 py-1 text-xs font-medium text-rose-700 hover:bg-rose-50 disabled:cursor-not-allowed disabled:opacity-50"
+      className="min-h-11 rounded-md border border-rose-300 bg-white px-2 py-1 text-xs font-medium text-rose-700 hover:bg-rose-50 disabled:cursor-not-allowed disabled:opacity-50"
     >
       {retryFailed.isPending
         ? 'Retrying...'
@@ -56,7 +56,29 @@ function eventsByStage(events: StageEventOut[]): Record<string, StageEventOut> {
   return out
 }
 
+function stageTooltip(stage: string, e: StageEventOut): string {
+  const detail = e.detail as { attempts?: Array<{ error_message?: string | null }> } | undefined
+  const attemptErrors = (detail?.attempts ?? []).map((a) => a.error_message).filter((m): m is string => Boolean(m))
+  return [
+    `${stage}: ${e.duration_s.toFixed(2)}s`,
+    e.error ? `ERROR: ${e.error}` : null,
+    attemptErrors.length > 0 ? `failed attempts: ${attemptErrors.join(' | ')}` : null,
+  ]
+    .filter(Boolean)
+    .join(' - ')
+}
+
+function stageHasDiagnostic(e: StageEventOut): boolean {
+  const detail = e.detail as { attempts?: Array<{ error_message?: string | null }> } | undefined
+  return Boolean(e.error) || (detail?.attempts ?? []).some((a) => Boolean(a.error_message))
+}
+
 function StageTimelineTab({ pages, stagesByPage }: { pages: number[]; stagesByPage: Record<number, StageEventOut[]> }) {
+  // The hover title="..." tooltip below is how this error text is normally
+  // read - meaningless on a touchscreen. Tapping a segment instead opens
+  // this same text right under its row, so diagnosing a failure doesn't
+  // depend on a mouse being present.
+  const [expanded, setExpanded] = useState<{ page: number; stage: string } | null>(null)
   return (
     <div className="flex flex-col gap-3">
       <div className="flex flex-wrap gap-3 text-xs text-slate-500">
@@ -67,6 +89,13 @@ function StageTimelineTab({ pages, stagesByPage }: { pages: number[]; stagesByPa
           </span>
         ))}
       </div>
+      {/* Each row needs real width to keep its stage segments and the
+          attempts/duration labels legible - rather than squashing all of
+          that down to fit a phone screen, the rows scroll horizontally,
+          with a "scroll for more →" hint as the visible affordance (see
+          the run table above for the same pattern). */}
+      <p className="text-xs text-slate-400 md:hidden">Scroll for more →</p>
+      <div className="flex flex-col gap-3 overflow-x-auto">
       {pages.map((pageNum) => {
         const events = stagesByPage[pageNum] ?? []
         const byStage = eventsByStage(events)
@@ -77,47 +106,53 @@ function StageTimelineTab({ pages, stagesByPage }: { pages: number[]; stagesByPa
         // and the segment width alone can't tell the two apart.
         const geminiDetail = byStage['gemini_call']?.detail as { attempt_count?: number; sleep_total_s?: number } | undefined
         const attemptCount = geminiDetail?.attempt_count ?? 1
+        const expandedEvent = expanded && expanded.page === pageNum ? byStage[expanded.stage] : undefined
         return (
-          <div key={pageNum} className="flex items-center gap-3">
-            <span className="w-16 shrink-0 text-xs text-slate-500">page {pageNum}</span>
-            <div className="flex h-5 flex-1 overflow-hidden rounded-md bg-slate-100">
-              {STAGE_ORDER.map((stage) => {
-                const e = byStage[stage]
-                if (!e) return null
-                const widthPct = (e.duration_s / total) * 100
-                const detail = e.detail as { attempts?: Array<{ error_message?: string | null }> } | undefined
-                const attemptErrors = (detail?.attempts ?? [])
-                  .map((a) => a.error_message)
-                  .filter((m): m is string => Boolean(m))
-                const tooltip = [
-                  `${stage}: ${e.duration_s.toFixed(2)}s`,
-                  e.error ? `ERROR: ${e.error}` : null,
-                  attemptErrors.length > 0 ? `failed attempts: ${attemptErrors.join(' | ')}` : null,
-                ]
-                  .filter(Boolean)
-                  .join(' - ')
-                return (
-                  <div
-                    key={stage}
-                    title={tooltip}
-                    className={`${STAGE_COLOR[stage]} ${e.error ? 'ring-2 ring-inset ring-rose-600' : ''} h-full`}
-                    style={{ width: `${widthPct}%` }}
-                  />
-                )
-              })}
+          <div key={pageNum} className="flex min-w-[480px] flex-col gap-1">
+            <div className="flex items-center gap-3">
+              <span className="w-16 shrink-0 text-xs text-slate-500">page {pageNum}</span>
+              <div className="flex h-5 flex-1 overflow-hidden rounded-md bg-slate-100">
+                {STAGE_ORDER.map((stage) => {
+                  const e = byStage[stage]
+                  if (!e) return null
+                  const widthPct = (e.duration_s / total) * 100
+                  const hasDiagnostic = stageHasDiagnostic(e)
+                  return (
+                    <div
+                      key={stage}
+                      title={stageTooltip(stage, e)}
+                      onClick={
+                        hasDiagnostic
+                          ? () => setExpanded((prev) => (prev?.page === pageNum && prev.stage === stage ? null : { page: pageNum, stage }))
+                          : undefined
+                      }
+                      className={`${STAGE_COLOR[stage]} ${e.error ? 'ring-2 ring-inset ring-rose-600' : ''} ${
+                        hasDiagnostic ? 'cursor-pointer' : ''
+                      } h-full`}
+                      style={{ width: `${widthPct}%` }}
+                    />
+                  )
+                })}
+              </div>
+              {attemptCount > 1 && (
+                <span
+                  title={`Gemini call took ${attemptCount} attempts (${(geminiDetail?.sleep_total_s ?? 0).toFixed(1)}s spent sleeping between retries)`}
+                  className="shrink-0 rounded-full bg-amber-100 px-1.5 py-0.5 text-xs font-medium text-amber-700"
+                >
+                  {attemptCount} attempts
+                </span>
+              )}
+              <span className="w-14 shrink-0 text-right text-xs text-slate-400">{total.toFixed(2)}s</span>
             </div>
-            {attemptCount > 1 && (
-              <span
-                title={`Gemini call took ${attemptCount} attempts (${(geminiDetail?.sleep_total_s ?? 0).toFixed(1)}s spent sleeping between retries)`}
-                className="shrink-0 rounded-full bg-amber-100 px-1.5 py-0.5 text-xs font-medium text-amber-700"
-              >
-                {attemptCount} attempts
-              </span>
+            {expandedEvent && (
+              <p className="ml-[4.75rem] rounded bg-rose-50 px-2 py-1 text-xs text-rose-700">
+                {stageTooltip(expanded!.stage, expandedEvent)}
+              </p>
             )}
-            <span className="w-14 shrink-0 text-right text-xs text-slate-400">{total.toFixed(2)}s</span>
           </div>
         )
       })}
+      </div>
     </div>
   )
 }
@@ -293,7 +328,7 @@ function RawInspectorTab({ runId, pages }: { runId: string; pages: number[] }) {
       {rawQuery.isLoading && <p className="text-sm text-slate-400">Loading...</p>}
       {rawQuery.isError && <p className="text-sm text-slate-400">No raw exchange recorded for this page.</p>}
       {rawQuery.data && (
-        <div className="grid grid-cols-2 gap-4">
+        <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
           <div>
             <h3 className="mb-1 text-xs font-semibold uppercase tracking-wide text-slate-500">
               Prompt sent (includes the line-numbered dump the model saw)
@@ -376,12 +411,12 @@ export function PipelineRunDetail({ runId }: { runId: string }) {
         </div>
       </div>
 
-      <div className="flex gap-1 border-b border-slate-200">
+      <div className="flex gap-1 overflow-x-auto border-b border-slate-200">
         {tabs.map((t) => (
           <button
             key={t.id}
             onClick={() => setTab(t.id)}
-            className={`px-4 py-2 text-sm font-medium ${
+            className={`min-h-11 shrink-0 whitespace-nowrap px-4 py-2 text-sm font-medium ${
               tab === t.id ? 'border-b-2 border-teal-600 text-teal-700' : 'text-slate-500 hover:text-slate-700'
             }`}
           >

@@ -16,4 +16,17 @@ describe('Sidebar', () => {
       expect(screen.getByRole('link', { name: label })).toBeInTheDocument()
     }
   })
+
+  it('the logo is a real link to Home, not a click handler on a div', () => {
+    render(
+      <MemoryRouter initialEntries={['/summaries']}>
+        <Sidebar />
+      </MemoryRouter>,
+    )
+
+    // A real <a href="/"> is what makes middle-click/ctrl-click/keyboard
+    // "open in new tab" work, unlike a div with an onClick navigate() call.
+    const logo = screen.getByRole('link', { name: /PressDigest/ })
+    expect(logo).toHaveAttribute('href', '/')
+  })
 })

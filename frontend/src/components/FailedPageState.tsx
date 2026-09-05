@@ -53,7 +53,7 @@ export function FailedPageState({
           <button
             onClick={onRetry}
             disabled={retrying}
-            className="rounded-lg bg-teal-600 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-teal-700 disabled:cursor-not-allowed disabled:bg-slate-300"
+            className="inline-flex min-h-11 items-center rounded-lg bg-teal-600 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-teal-700 disabled:cursor-not-allowed disabled:bg-slate-300"
           >
             {retrying ? 'Retrying...' : 'Retry this page'}
           </button>
@@ -61,7 +61,7 @@ export function FailedPageState({
         {nextAvailablePage !== null && (
           <Link
             to={`/reader/${editionId}/${nextAvailablePage}`}
-            className="rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50"
+            className="inline-flex min-h-11 items-center rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50"
           >
             Go to next available page →
           </Link>

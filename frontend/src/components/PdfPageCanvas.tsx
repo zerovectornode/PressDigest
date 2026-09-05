@@ -51,6 +51,12 @@ export function PdfPageCanvas({
   const [percentInput, setPercentInput] = useState('100')
   const [error, setError] = useState<string | null>(null)
   const [loadingDoc, setLoadingDoc] = useState(false)
+  // Percent of the PDF downloaded so far, while a new document is loading -
+  // null once loaded/unknown. Backed by real numbers: the measured
+  // worst case (throttled mobile, an 11MB edition) was ~33s to first
+  // paint, long enough that a static "Loading page…" with no progress
+  // reads as broken - see design/DESIGN.md.
+  const [loadPercent, setLoadPercent] = useState<number | null>(null)
   // Bumped whenever the pane's own footprint changes (e.g. dragging the
   // split divider in PageReader) so the render effect re-measures and
   // re-fits - this is the ONLY thing that should resize the pane; zoom
@@ -69,6 +75,9 @@ export function PdfPageCanvas({
     // destroy() lives on the loading task, not the resolved document proxy.
     if (cached) cached.task.destroy()
     const task = pdfjs.getDocument({ url })
+    task.onProgress = ({ loaded, total }: { loaded: number; total: number }) => {
+      if (total > 0) setLoadPercent(Math.min(100, Math.round((loaded / total) * 100)))
+    }
     docCacheRef.current = { url, task, promise: task.promise }
     return task.promise
   }
@@ -104,12 +113,18 @@ export function PdfPageCanvas({
       // Page turns, zoom changes, and pane resizes within the same
       // edition all hit the cache below instead.
       const isNewDocument = docCacheRef.current?.url !== pdfUrl
-      if (isNewDocument) setLoadingDoc(true)
+      if (isNewDocument) {
+        setLoadingDoc(true)
+        setLoadPercent(null)
+      }
       try {
         const doc = await loadDocument(pdfUrl)
         const page = await doc.getPage(pageNum)
         if (cancelled) return
-        if (isNewDocument) setLoadingDoc(false)
+        if (isNewDocument) {
+          setLoadingDoc(false)
+          setLoadPercent(null)
+        }
 
         // Measured from the pane's own box, which is now sized by the
         // surrounding flex layout / split divider - never by this canvas's
@@ -147,6 +162,7 @@ export function PdfPageCanvas({
         if (!cancelled) {
           setError(e instanceof Error ? e.message : String(e))
           setLoadingDoc(false)
+          setLoadPercent(null)
         }
       }
     }
@@ -178,7 +194,13 @@ export function PdfPageCanvas({
 
   return (
     <div className="flex h-full min-w-0 flex-col">
-      <div className="flex items-center justify-end gap-2 border-b border-slate-200 bg-white px-4 py-2">
+      {/* Numeric zoom + fit presets are a desktop-mouse control surface -
+          on mobile, fit-width is the fixed default (zoom state never
+          changes away from it here, since nothing below renders to
+          change it) and the browser's own native pinch-to-zoom - not
+          disabled by anything in this pane's CSS or the app's viewport
+          meta tag - is the zoom mechanism instead. */}
+      <div className="hidden items-center justify-end gap-2 border-b border-slate-200 bg-white px-4 py-2 md:flex">
         <button
           onClick={() => setZoom({ mode: 'fit-width' })}
           className={`rounded-md border px-2 py-1 text-xs ${
@@ -232,8 +254,13 @@ export function PdfPageCanvas({
           // visit to this edition, or switching editions) - a plain
           // page-turn/zoom/resize never shows this, since loadDocument
           // reuses the already-parsed document for those.
-          <div className="absolute inset-0 z-10 flex items-center justify-center bg-slate-100/80">
-            <p className="text-sm text-slate-500">Loading page…</p>
+          <div className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-2 bg-slate-100/80">
+            <p className="text-sm text-slate-500">Loading page{loadPercent !== null ? `… ${loadPercent}%` : '…'}</p>
+            {loadPercent !== null && (
+              <div className="h-1.5 w-32 overflow-hidden rounded-full bg-slate-200">
+                <div className="h-full rounded-full bg-teal-500 transition-[width]" style={{ width: `${loadPercent}%` }} />
+              </div>
+            )}
           </div>
         )}
         <div className="relative mx-auto w-fit shadow-md">
@@ -245,6 +272,7 @@ export function PdfPageCanvas({
                 return (
                   <div
                     key={`${h.id}-${i}`}
+                    data-highlight-id={h.id}
                     onClick={() => onHighlightClick?.(h.id)}
                     onMouseEnter={() => onHighlightHover?.(h.id)}
                     onMouseLeave={() => onHighlightHover?.(null)}

@@ -1,7 +1,7 @@
 import { useState } from 'react'
-import { NavLink } from 'react-router-dom'
+import { Link, NavLink } from 'react-router-dom'
 
-const NAV_ITEMS = [
+export const NAV_ITEMS = [
   { to: '/', label: 'Home', icon: HomeIcon },
   { to: '/summaries', label: 'Summaries', icon: GridIcon },
   { to: '/reader', label: 'Page Reader', icon: BookIcon },
@@ -36,17 +36,27 @@ export function Sidebar() {
   }
 
   return (
+    // Hidden below the mobile breakpoint - see useIsMobile.ts. It must not
+    // consume horizontal space on a phone; MobileNavDrawer is the mobile
+    // equivalent, rendered separately by App.tsx. Desktop's own collapse
+    // behavior (the w-16/w-60 toggle below) is untouched.
     <aside
-      className={`flex h-full shrink-0 flex-col border-r border-slate-200 bg-white transition-[width] duration-150 ${
+      className={`hidden h-full shrink-0 flex-col border-r border-slate-200 bg-white transition-[width] duration-150 md:flex ${
         collapsed ? 'w-16' : 'w-60'
       }`}
     >
-      <div className={`flex items-center gap-2 px-6 py-6 ${collapsed ? 'justify-center px-0' : ''}`}>
+      <Link
+        to="/"
+        title="Go to Home"
+        className={`flex items-center gap-2 rounded-lg px-6 py-6 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-500 ${
+          collapsed ? 'justify-center px-0' : ''
+        }`}
+      >
         <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-teal-600 text-sm font-bold text-white">
           P
         </div>
         {!collapsed && <span className="text-lg font-semibold tracking-tight text-slate-900">PressDigest</span>}
-      </div>
+      </Link>
       <nav className="flex flex-1 flex-col gap-1 px-3">
         {NAV_ITEMS.map(({ to, label, icon: Icon }) => (
           <NavLink

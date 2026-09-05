@@ -33,7 +33,11 @@ export function SummaryCardGrid({
   onSelect?: (article: RankedArticleOut) => void
 }) {
   return (
-    <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
+    // sm:grid-cols-2 would kick in at 640px, inside our own 768px mobile
+    // range (see useIsMobile.ts) - md: keeps the whole mobile range at a
+    // single column instead of squeezing two narrow cards in at
+    // 640-767px.
+    <div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-4">
       {articles.map((article) => (
         <article
           key={article.article_id}
