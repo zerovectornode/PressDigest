@@ -1,0 +1,14 @@
+[Unit]
+Description=Run PressDigest edition/cache pruning daily
+
+[Timer]
+OnCalendar=daily
+# Spreads actual execution over a 30-minute window instead of every
+# machine running it at exactly 00:00 - irrelevant with one VM, kept
+# anyway since it costs nothing and is the normal default for this kind
+# of housekeeping timer.
+RandomizedDelaySec=1800
+Persistent=true
+
+[Install]
+WantedBy=timers.target

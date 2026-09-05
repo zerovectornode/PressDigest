@@ -1,0 +1,68 @@
+[Unit]
+Description=PressDigest (uvicorn)
+After=network.target
+
+[Service]
+Type=simple
+User=pressdigest
+Group=pressdigest
+WorkingDirectory=/opt/pressdigest/app
+
+# hindu_extract is never pip installed on this VM (see requirements.txt's
+# header comment) - imported straight from the git-cloned source tree
+# (see update.sh) via PYTHONPATH. HINDU_EXTRACT_DATA_ROOT points pipeline
+# output at a separate volume from the app code (/var/lib/pressdigest,
+# not /opt/pressdigest/app) specifically so update.sh's `git reset
+# --hard` - scoped to /opt/pressdigest/app, the git working tree - can
+# never wipe an extracted edition. Non-secret, so these live here
+# (versioned, visible in a diff) rather than in the env file below, which
+# is reserved for the actual secret.
+Environment=PYTHONPATH=/opt/pressdigest/app/src
+Environment=HINDU_EXTRACT_DATA_ROOT=/var/lib/pressdigest
+Environment=HINDU_EXTRACT_MAX_CONCURRENT=2
+Environment=LOG_LEVEL=INFO
+
+EnvironmentFile=/etc/pressdigest/env
+
+# Enables cgroup memory accounting for this unit specifically - without
+# it, memory.current/memory.peak under this unit's cgroup may not be
+# meaningfully populated on every systemd version. This is how peak RAM
+# during an extraction gets measured (see README "Deploying"):
+#   cat /sys/fs/cgroup/system.slice/pressdigest.service/memory.peak
+# read directly from the cgroup v2 file rather than via `systemctl show
+# -p MemoryPeak` (that property is a newer systemd addition than what
+# Debian 12 ships - the file always works regardless of systemd version,
+# as long as cgroup v2 is in use, which is Debian 12's default).
+MemoryAccounting=yes
+
+# --workers 1, explicit rather than relying on uvicorn's own default of
+# 1: this is a 1GB-RAM machine, and a second worker process would double
+# memory for zero benefit (extraction is Gemini-network-bound, not
+# CPU-bound - see design/DESIGN.md "Deployment: GCP e2-micro VM"). Bound
+# to 127.0.0.1 only, never 0.0.0.0 - Caddy is the sole ingress and the
+# only thing allowed to terminate a connection from the outside.
+ExecStart=/opt/pressdigest/venv/bin/uvicorn hindu_extract.api.main:app --host 127.0.0.1 --port 8000 --workers 1
+
+Restart=always
+RestartSec=5
+
+# Generous: a cold Python import (pdfplumber's dependency tree is not
+# small) on this CPU's 0.25-vCPU sustained baseline, under whatever
+# contention the shared physical core has at that moment, can plausibly
+# take much longer than systemd's 90s default - a false "failed to start"
+# from an overly strict timeout would be a self-inflicted outage.
+TimeoutStartSec=120
+
+# Hardening. The service only ever needs to write under
+# /var/lib/pressdigest (uploads, bronze, gold, cache, trace - see
+# config/default.yaml paths: and HINDU_EXTRACT_DATA_ROOT above) -
+# ReadWritePaths is the actual enforcement boundary, on top of the
+# ownership setup.sh sets up (pressdigest owns the whole app+venv tree in
+# this design, since nothing needs root - see requirements.txt).
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/pressdigest
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,40 @@
+# --- Copyrighted / licensed source material -------------------------------
+# Never bake a newspaper PDF, or anything derived from one, into the image.
+*.pdf
+docs/*
+!docs/.gitkeep
+
+# --- Pipeline output/cache/trace - ephemeral by design in the container ---
+data/
+
+# --- Secrets ----------------------------------------------------------------
+.env
+.env.*
+!.env.example
+
+# --- Git / editor / OS -------------------------------------------------------
+.git/
+.gitignore
+.idea/
+.vscode/
+.DS_Store
+
+# --- Python -------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+*.egg
+tests/
+
+# --- Frontend - node_modules and any stale local build are rebuilt fresh
+# inside the image; excluding them keeps the build context small and avoids
+# ever shipping a build that doesn't match the source being copied in.
+frontend/node_modules/
+frontend/dist/
+.vite/
+
+# --- Claude Code session-local state (not project content) ------------------
+.claude/

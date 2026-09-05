@@ -1,0 +1,290 @@
+# Phase 1 configuration. No thresholds or paths belong in code — only here.
+# Calibration notes reference measurements taken directly on docs/Newspaper.pdf
+# (18-page The Hindu Delhi e-paper, 2025-09-13 issue) during initial inspection.
+
+pipeline_version: "2.1.0"  # bumped for the word-space gap fix (lines.py now
+                            # computes Line.corrected_text - see
+                            # word_space_gap_ratio below and design/DESIGN.md
+                            # "Word-space gap fix"); Line.text itself is
+                            # unchanged (still the literal glyph-joined text),
+                            # so this does NOT change the Gemini prompt dump
+                            # or its cache key - only Phase 1's bronze cache
+                            # needs to be invalidated, not Phase 2's
+
+paths:
+  bronze_root: "data/bronze"
+  cache_root: "data/cache"
+  gold_root: "data/gold"
+  gemini_cache_root: "data/cache/gemini"
+  raw_pdf_root: "data/raw"
+  trace_db: "data/trace/trace.db"
+  ranking_cache_root: "data/cache/ranking"
+
+thresholds:
+  # A span's font_size >= size_outlier_ratio * page_modal_font_size is flagged
+  # size_outlier=true (drop-cap / headline candidate). Per spec: computed per
+  # page, never globally.
+  size_outlier_ratio: 3.0
+
+  # Geometric glyph-drop canary (replaces a dictionary/ligature-insertion
+  # approach - see design/DESIGN.md "Ligature canary" section for why that
+  # approach was rejected). Within a single span (one line, one contiguous
+  # font/size/style run), the gap between two adjacent non-space characters
+  # is compared to this ratio * that character's font_size. Exceeding it
+  # means a glyph (e.g. a dropped f-ligature) likely failed to extract,
+  # leaving an unexplained hole.
+  #
+  # Calibrated on this PDF: measured intra-word gap/font_size ratios across
+  # all 18 pages (136,528 adjacent char pairs, tokenized with pdfplumber's
+  # own extract_words() - deliberately NOT this package's line/span
+  # grouping, since extract_words()'s internal layout heuristics correctly
+  # keep column-separated fragments as distinct words while this package's
+  # simpler row/gap grouping does not; see span_break_gap_ratio below) gave
+  # p50=-0.01, p99=0.19, p999=0.28, max=0.60 (the max came entirely from the
+  # page-11 stock-ticker row where a decorative leader-dot font abuts
+  # numerals). 0.75 sits with ~25% headroom above every observed legitimate
+  # gap in this corpus while staying well below the width of a fully
+  # dropped glyph.
+  kerning_gap_ratio: 0.75
+
+  # Chars sharing a y-band (row) can belong to different newspaper columns
+  # that happen to align vertically - this newspaper synchronizes baselines
+  # across columns to a shared leading grid, so it happens constantly, not
+  # just in rare wide-block cases (verified: page 1 body text merges
+  # "first"+"According" from two different columns into one span's text
+  # with no separator at all when this split is missing or set too high).
+  #
+  # A gap between consecutive same-style characters in the same row that
+  # exceeds span_break_gap_ratio * that char's font_size always starts a
+  # new span/line_id, even though font/style did not change and the y-band
+  # is the same.
+  #
+  # Calibrated on this PDF: real same-column inter-word gaps measured
+  # ~1.2-1.5pt (ratio ~0.17-0.2 at 9pt modal size, p999 0.28 measured over
+  # 136k char pairs). Real column-transition gaps on page 1 body text
+  # measured as low as 7.9pt (ratio 0.875) up to 50pt+. There is no
+  # magnitude that cleanly separates "large legitimate gap" from "dropped
+  # glyph" here - the two are genuinely confounded on this narrow-column
+  # layout. Given that under-splitting silently FUSES unrelated column text
+  # into one misleading span (a real correctness bug) while over-splitting
+  # only produces more numerous, still fully verbatim spans (harmless),
+  # 0.5 is set below the smallest observed real column-transition gap so
+  # every known transition reliably splits, accepting that this also
+  # splits some ticker/leader-dot runs finer than strictly necessary.
+  span_break_gap_ratio: 0.5
+
+  # Vertical tolerance for clustering characters into the same row-band,
+  # relative to the page's modal font size. Standard fraction-of-em banding.
+  row_band_tolerance_ratio: 0.3
+
+  # Word-space gap fix (see design/DESIGN.md "Word-space gap fix"): some
+  # single-character words ("A", "a", "I") in this PDF have no space glyph
+  # in the content stream at all between them and the next word - only a
+  # normal-width positioning gap, e.g. "Apeek" for "A peek" on page 17. When
+  # two ADJACENT ALPHABETIC characters within one line have no space glyph
+  # between them and gap/font_size exceeds this ratio, lines.py inserts a
+  # synthetic ASCII space into Line.corrected_text (Line.text, the literal
+  # glyph-joined text used for the Gemini prompt, is never touched - see
+  # pipeline_version above).
+  #
+  # Calibrated on this PDF: measured normal intra-word (alpha-to-alpha)
+  # kerning gap ratio ceiling across all 18 pages was <=0.088 (page 6),
+  # typically <=0.05, using pdfplumber's own extract_words() to identify
+  # genuine single words. Measured gap ratios for 8 confirmed missing-space
+  # bugs sampled across 8 different pages (aday, anote, Ihave, ABench,
+  # Arelentless, Ineed, Apeek, Afor) ranged 0.18-0.54, and a full-edition
+  # geometric sweep (alpha-only pairs, ratio in (0.10, 0.8] to also exclude
+  # a page-11 stock-table leader-dot line at ratio 8.9) found genuine
+  # instances up to 0.71. Zero overlap between the two populations at any
+  # value in [0.088, 0.18]. 0.12 sits in the middle of that gap; the
+  # before/after impact count was stable within 5 insertions across the
+  # whole tested range (0.08/0.10/0.12/0.15), so the exact value in this
+  # range is not load-bearing. Restricted to alphabetic pairs specifically
+  # because that is what excluded the page-11 stock-table leader-dot line
+  # (ratio 8.9, digits/periods, not letters) automatically, without a
+  # separate magnitude cap.
+  word_space_gap_ratio: 0.12
+
+render:
+  # High-res render is NOT persisted for every page (18 pages x 300 DPI would
+  # be hundreds of MB, opened rarely). Generated on demand via the CLI for a
+  # specific page (debug/audit crops, and later Phase 2 region crops).
+  hires_dpi: 300
+
+canary:
+  # Font names with no per-page override use these substrings (case
+  # insensitive) to infer style from the embedded BaseFont name, since
+  # subsetted newspaper fonts rarely expose usable style flags any other way.
+  bold_markers: ["bold", "black", "heavy", "semibold"]
+  italic_markers: ["italic", "oblique"]
+
+gemini:
+  # Phase 2 boundary-finding call. Text-only in v1 (see design/DESIGN.md
+  # "No vision pass in v1" for why: ads on this PDF have almost no text -
+  # page 5 is 68 characters total - so they fall out naturally by having no
+  # lines to draw a boundary around, without needing a vision pass).
+  model: "gemini-3.1-flash-lite"
+
+  # History (see design/DESIGN.md "Gemini 3.x thinking tokens count against
+  # the output ceiling" and "Stream-order rebuild"): under the old
+  # unit-ID-list architecture, HIGH thinking repeatedly truncated
+  # (62,913-47,181 thought tokens against a 65,536 hard ceiling) because
+  # the model was doing large-scale ordering/bookkeeping over ~380 IDs.
+  # That whole task is gone now: the model finds a handful of line-number
+  # boundaries per article instead of selecting and ordering every unit.
+  # Step A latency experiment (page 1, bypassing cache, same prompt at each
+  # level): HIGH took 98.95s / 52,960 total tokens (47,183 of them
+  # thinking) and passed validation. MEDIUM took 9.72s / 7,147 total tokens
+  # (1,327 thinking) and found byte-identical line-range boundaries
+  # (Nepal body 57-196, inflation body 229-264, headline 197) with zero
+  # checksum/contiguity failures - a ~10x latency and ~7x token win for no
+  # measurable quality loss on this page. LOW took 8.81s / 7,732 tokens but
+  # FAILED validation: its end_words checksums were genuinely incomplete
+  # (e.g. "compared with 5.3%" instead of the real last words "5.3% in
+  # August last year") even though the line-range numbers it picked were
+  # still correct - a real self-verification quality regression, not the
+  # known drop-cap whitespace artifact _fuzzy_prefix/suffix_match tolerates
+  # (phase3.py). MEDIUM is the lowest level that still passes validation,
+  # so it's the default; HIGH remains available as a per-run override if a
+  # future page's boundaries look wrong at MEDIUM.
+  thinking_level: "MEDIUM"
+  temperature: 0.0
+
+  # Generous relative to the new ~300-token output size; kept well below
+  # Flash-Lite's 65,536 hard ceiling so a still-too-large response fails
+  # loudly with a diagnosable (thoughts, candidates, finish_reason) triple
+  # instead of truncating silently at the model's own limit.
+  max_output_tokens: 49152
+
+  # Bump this to invalidate ALL cached Gemini responses (it's part of the
+  # cache key alongside the line dump, model id, thinking_level, and
+  # max_output_tokens) without needing to change the model or re-run Phase 1.
+  # v5: line dump gained a D/- drop-cap flag column, and the system prompt
+  # now explicitly excludes drop caps from "largest font = headline" -
+  # fixes the page-6 bug where a drop cap was mistaken for a headline (see
+  # design/DESIGN.md "Standing rule: exclude single_glyph/size_outlier from
+  # font-size comparisons"). A v4-cached response reflects the old dump
+  # format the model never saw the D column in, so it must not be served
+  # under v5's key.
+  # v6: added a `section_kicker` field and an explicit rule that ALL-CAPS
+  # standing-head labels (e.g. "GROUND ZERO") are furniture, not headlines
+  # - third occurrence of "largest font wins" picking up page furniture
+  # (drop caps, then this). Found live on page 7: the fix for drop caps
+  # alone still let a 39.9pt section kicker outrank the real ~20pt
+  # headline, losing the real headline and deck entirely.
+  prompt_version: "v6"
+
+concurrency:
+  # Real quotas: 500 requests/day, 15 requests/minute, 250,000 tokens/minute.
+  # At MEDIUM thinking (~9-10s/call, ~7,150 measured tokens/call on page 1),
+  # the 15 RPM cap binds before the 250K TPM cap does: one continuously-busy
+  # worker already produces ~6 requests/minute, so 250K/7,150 ~= 34 requests
+  # worth of TPM headroom is never the limiting factor at this speed - RPM
+  # is. tokens_per_minute is still enforced independently (a page with far
+  # more lines than page 1 could cost much more per call), so both windows
+  # are real ceilings, not just RPM in practice.
+  max_concurrent: 4
+
+  requests_per_minute: 15
+
+  requests_per_day: 500
+
+  tokens_per_minute: 250000
+
+  # Reserved against the tokens_per_minute window before a call's real
+  # usage is known (rate_limit.py corrects this to the actual total once
+  # the response returns). Set above the measured MEDIUM page-1 total
+  # (7,147) with margin for pages with more lines/articles than page 1.
+  estimated_tokens_per_request: 12000
+
+# Transport-layer retry for a single Gemini call (gemini_client.py), covering both
+# Phase 2's page calls and Phase 4's ranking call - see design/DESIGN.md "Gemini retry
+# policy" for the 2026-09-04 503 incident (run c5124271) that prompted this: page 1
+# failed after 7.73s with zero retries, and the failure was then unrecoverable in the
+# reader (see "Page failure state model" in the same doc).
+gemini_retry:
+  # 1 initial attempt + 3 retries - enough to ride out a multi-minute demand spike
+  # (the incident's 503 was transient, not persistent) without one page blocking an
+  # otherwise-fine 20-page edition indefinitely.
+  max_attempts: 4
+
+  # First retry waits ~4s - long enough that a transient 503/500/504 has a real chance
+  # to have cleared server-side before we ask again.
+  base_delay_s: 4.0
+
+  # Nominal ladder is base_delay_s * multiplier**attempt = 4s, 8s, 16s.
+  multiplier: 2.0
+
+  # Actual sleep = uniform(0.5x, 1.5x) of the nominal delay above. Matters specifically
+  # because production Phase 2 concurrency is 2 (HINDU_EXTRACT_MAX_CONCURRENT=2) -
+  # un-jittered retries would land two concurrent workers back into the same demand
+  # spike in lockstep, repeatedly.
+  jitter: 0.5
+
+  # Caps the ladder so a page never waits longer than this between attempts, even if
+  # the nominal exponential value would be larger.
+  max_delay_s: 30.0
+
+  # Per-attempt call timeout via the SDK's own types.HttpOptions(timeout=...), not a
+  # hand-rolled thread timeout. Well above the ~9-10s MEDIUM-thinking baseline (see
+  # concurrency's calibration note above) - only fires for a genuinely hung connection,
+  # which then counts as a retryable failure like any other transient error.
+  timeout_s: 120.0
+
+  # 429 RESOURCE_EXHAUSTED is a separate path, not the ladder above (see
+  # gemini_client.py) - 21 calls/edition at concurrency 2 against 15 RPM / 250K TPM
+  # makes RPM/TPM exhaustion implausible, so a 429 is far more likely the daily (RPD)
+  # cap, which is not worth retrying against (see quota_fallback_delay_s below and the
+  # RPD fail-fast check in code). When the API does give a retry-after/RetryInfo hint,
+  # honour it but never wait longer than this.
+  quota_retry_after_cap_s: 90.0
+
+  # No retry-after hint given: wait this long (one RPM window) before the single
+  # allowed 429 retry.
+  quota_fallback_delay_s: 60.0
+
+ranking:
+  # Edition-wide importance ranking - a single call across every article on
+  # every page, not per-page (per-page scores aren't comparable to each
+  # other: a weak page's best article would look artificially important
+  # next to nothing to compete with). This is a genuine ranking/judgment
+  # task across ~107 articles at once, not a boundary-finding task, so it
+  # gets its own model settings rather than reusing gemini.* above.
+  model: "gemini-3.1-flash-lite"
+
+  # HIGH truncated on the very first live attempt: thoughts=47,184 +
+  # candidates=1,953 against this same max_output_tokens=49152 ceiling -
+  # essentially the identical failure mode already documented for gemini.*
+  # above (thoughts scale to consume whatever ceiling is given, not to the
+  # task's real complexity). Switched to MEDIUM on the same reasoning that
+  # worked there: a live bypass-cache retry at MEDIUM ranked all 20
+  # articles cleanly in 23,512 total tokens (1,155 of them thinking) with
+  # sensible category/score output - no evidence HIGH's extra reasoning
+  # budget was needed for this task. Re-raising max_output_tokens instead
+  # was deliberately NOT tried first, per the same precedent: past
+  # experience in this project is that raising the ceiling for HIGH just
+  # lets thinking grow further rather than converging.
+  thinking_level: "MEDIUM"
+  temperature: 0.0
+
+  # Generous relative to the ~2K-token real output measured at MEDIUM;
+  # kept well below Flash-Lite's 65,536 hard ceiling so a still-too-large
+  # response fails loudly instead of truncating silently.
+  max_output_tokens: 49152
+
+  # Bump to invalidate cached rankings (part of the cache key alongside the
+  # article corpus + model id) without needing to change the model.
+  # v2: revised opinion-exclusion criteria (an editorial that examines
+  # evidence/consequences is eligible; one that merely asserts a view is
+  # not - see design/DESIGN.md), added a "PROCEDURAL VS. SUBSTANTIVE"
+  # guidance line, and added the `excluded` field so a rejected article's
+  # reasoning is visible instead of unrecorded.
+  prompt_version: "v2"
+
+  # Enough to judge analytical depth (does this piece explain causes/
+  # impacts, or just report an event) without sending full bodies - a full
+  # edition's worth of complete article text would dwarf the ~13K-token
+  # budget this call is sized around.
+  body_preview_words: 100
+
+  top_n: 20

@@ -1,0 +1,25 @@
+# Third-party dependencies only - hindu_extract itself is never pip
+# installed on the VM (no editable install, no regular install either),
+# it's imported via PYTHONPATH pointing straight at the rsynced source
+# tree (see pressdigest.service's Environment=PYTHONPATH=.../src). That
+# sidesteps a real problem: a setuptools editable install writes an
+# egg-info directory back into the source tree, which would need the
+# deploying identity to have write access there on every single deploy -
+# a plain requirements.txt for dependencies only has no such requirement,
+# so the whole /opt/pressdigest tree can be owned by the low-privilege
+# service user throughout, no root-owned-code split needed.
+#
+# Keep this in sync with pyproject.toml's [project.dependencies] + the
+# "api" extra by hand - the list is short and changes rarely enough that
+# a generator script would be more machinery than the problem is worth.
+pdfplumber>=0.11
+pypdfium2
+Pillow
+PyYAML
+click
+google-genai
+python-dotenv
+pyspellchecker
+fastapi
+uvicorn[standard]
+python-multipart

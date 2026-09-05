@@ -1,0 +1,210 @@
+#!/usr/bin/env bash
+# First-time setup for a fresh Debian 12 e2-micro VM. Meant to run once;
+# safe to re-run (every step checks before acting) if you need to repair
+# something rather than rebuild the VM from scratch.
+#
+# REQUIRED ORDER: push to main, wait for the "Build and publish deploy
+# branch" GitHub Action to finish (Actions tab on the repo - it creates
+# the `deploy` branch this script clones below, which does not exist on a
+# repo that has never had that workflow run), *then* run this script.
+# Running it before that workflow has ever completed fails at the clone
+# step below with a clear message instead of a raw git error, precisely
+# because that ordering is easy to get backwards on a first-time setup.
+#
+# Fetched standalone (curl, not scp/clone-the-whole-repo - there is no
+# laptop in this design at all, only Cloud Shell / browser SSH). This
+# fetches from `main`, not `deploy` - main always exists (it's the
+# default branch), so there's no ordering problem for this specific URL,
+# only for the `deploy`-branch clone this script does internally further
+# down:
+#
+#   curl -fsSL https://raw.githubusercontent.com/zerovectornode/PressDigest/main/deploy/setup.sh -o setup.sh
+#   sudo bash setup.sh
+#
+# Because of that, this script cannot reference sibling deploy/ files the
+# way a normal checkout could - it clones the `deploy` branch itself
+# (step below) and references everything else from that clone afterward.
+set -euo pipefail
+
+if [ "$(id -u)" -ne 0 ]; then
+  echo "run as root (sudo bash setup.sh)" >&2
+  exit 1
+fi
+
+REPO_URL="https://github.com/zerovectornode/PressDigest.git"
+APP_DIR=/opt/pressdigest/app
+
+echo "==> apt packages"
+# Deliberately generous, not minimal - there is no local copy of this VM
+# to test against, so a missing shared library surfaces as a runtime
+# crash (or worse, a crash on the ONE code path - a specific PDF's font
+# subset, an unusual image filter - that happens not to be exercised
+# until real use) rather than a loud install-time failure. Covers:
+#   - python3-venv, python3-pip, python3-dev: the app's own virtualenv,
+#     and headers in case anything needs to build instead of using a
+#     prebuilt wheel.
+#   - build-essential: compiler fallback for the same reason.
+#   - libjpeg62-turbo, libpng16-16, zlib1g, libtiff6, libfreetype6,
+#     liblcms2-2, libopenjp2-7, libwebp7: Pillow's full image-format
+#     matrix. Modern Pillow wheels bundle all of these statically, so
+#     none of this is expected to actually be needed - installed anyway
+#     as insurance, per the same "cannot test locally" reasoning.
+#   - libxml2, libxslt1.1: some PDFs route text/font metadata through
+#     XML-based structures (XMP metadata, some font programs); pdfminer.six
+#     doesn't hard-require these, but they're cheap insurance too.
+#   - git: how this VM gets and updates the app now - see update.sh.
+#     Frontend building happens entirely in GitHub Actions (1GB RAM here
+#     would OOM on npm run build), so no Node/npm is installed at all.
+#   - curl, gnupg, debian-keyring, debian-archive-keyring,
+#     apt-transport-https: needed to add Caddy's official apt repo below
+#     (per caddyserver.com/docs/install#debian-ubuntu-raspbian).
+apt-get update
+apt-get install -y --no-install-recommends \
+    python3-venv python3-pip python3-dev build-essential \
+    libjpeg62-turbo libpng16-16 zlib1g libtiff6 libfreetype6 liblcms2-2 libopenjp2-7 libwebp7 \
+    libxml2 libxslt1.1 \
+    git curl gnupg debian-keyring debian-archive-keyring apt-transport-https
+
+echo "==> swapfile (1GB RAM is tight - pip installing pdfplumber's tree, and"
+echo "    extraction itself, both assume 2GB swap is active)"
+if ! swapon --show=NAME --noheadings | grep -q .; then
+  if [ ! -f /swapfile ]; then
+    fallocate -l 2G /swapfile
+    chmod 600 /swapfile
+    mkswap /swapfile
+  fi
+  swapon /swapfile
+  grep -q '^/swapfile ' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+  echo "swap activated"
+else
+  echo "swap already active, skipping"
+fi
+if ! swapon --show=NAME --noheadings | grep -q .; then
+  echo "!!! WARNING: swap is NOT active after attempting to enable it." >&2
+  echo "!!! pip installs and/or extraction may fail with OOM. Investigate before continuing." >&2
+fi
+
+echo "==> Caddy (official repo, not Debian's bundled/older package)"
+if ! command -v caddy &>/dev/null; then
+  curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
+    | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+  curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
+    > /etc/apt/sources.list.d/caddy-stable.list
+  apt-get update
+  apt-get install -y caddy
+else
+  echo "caddy already installed, skipping"
+fi
+
+echo "==> service user"
+if ! id -u pressdigest &>/dev/null; then
+  useradd --system --home-dir /opt/pressdigest --shell /usr/sbin/nologin pressdigest
+fi
+
+echo "==> directories"
+# App code + venv and the actual data live on separate trees on purpose:
+# update.sh's `git reset --hard` only ever touches /opt/pressdigest/app,
+# so /var/lib/pressdigest/data - extracted editions, the only copy of
+# what a Gemini call returned - can never be wiped by a routine update.
+#
+# Both trees stay owned by the pressdigest user indefinitely: with no
+# laptop and no rsync-over-SSH-as-root in this design at all, every git/
+# pip operation below and in update.sh runs as `sudo -u pressdigest`
+# consistently, so there's no root-vs-service-user ownership split to
+# reason about the way the earlier rsync-based design needed.
+mkdir -p /opt/pressdigest /var/lib/pressdigest/data
+chown pressdigest:pressdigest /opt/pressdigest /var/lib/pressdigest/data
+
+echo "==> checking the deploy branch exists"
+# Fails here, loudly and specifically, rather than a few lines further
+# down as a raw `git clone` error - this is exactly the mistake the
+# REQUIRED ORDER note at the top of this file exists to prevent: running
+# this script before the "Build and publish deploy branch" GitHub Action
+# has ever completed once, which is the only thing that creates the
+# `deploy` branch in the first place. `git ls-remote --exit-code` is a
+# read-only check against the remote, safe to run before committing to
+# anything.
+if ! git ls-remote --exit-code --heads "$REPO_URL" deploy > /dev/null 2>&1; then
+  echo "!!! The 'deploy' branch does not exist yet on $REPO_URL" >&2
+  echo "!!! This means the 'Build and publish deploy branch' GitHub Action" >&2
+  echo "!!! has never completed successfully - check the Actions tab on the" >&2
+  echo "!!! repo, push to main if you haven't yet, and wait for that workflow" >&2
+  echo "!!! to finish (it creates this branch). Then re-run this script." >&2
+  exit 1
+fi
+
+echo "==> cloning the deploy branch"
+# The `deploy` branch is a GitHub Actions build artifact (one commit,
+# force-pushed on every push to main - see .github/workflows/deploy.yml):
+# frontend/dist/ already built, everything else the VM needs, nothing it
+# doesn't (no tests/, no data/, no frontend source or node_modules).
+# --single-branch only (not --depth 1): every push replaces the branch
+# with a brand-new, unrelated root commit (not a new commit built on the
+# previous one - see the workflow), so a shallow clone would be fighting
+# a moving, disconnected shallow boundary on every single update.py's
+# `git fetch` for no actual size benefit - a single-commit branch has no
+# history to shallow-clone away from in the first place.
+if [ ! -d "$APP_DIR/.git" ]; then
+  sudo -u pressdigest git clone --branch deploy --single-branch "$REPO_URL" "$APP_DIR"
+else
+  echo "$APP_DIR already a git checkout, skipping clone (use update.sh to refresh it)"
+fi
+
+if [ ! -f /opt/pressdigest/venv/bin/python ]; then
+  sudo -u pressdigest python3 -m venv /opt/pressdigest/venv
+fi
+
+echo "==> installing Python dependencies"
+sudo -u pressdigest /opt/pressdigest/venv/bin/pip install --no-cache-dir -r "$APP_DIR/deploy/requirements.txt"
+sha256sum "$APP_DIR/deploy/requirements.txt" | awk '{print $1}' | sudo -u pressdigest tee /opt/pressdigest/.requirements.sha256 > /dev/null
+
+echo "==> app secrets"
+mkdir -p /etc/pressdigest
+if [ ! -f /etc/pressdigest/env ]; then
+  cp "$APP_DIR/deploy/env.example" /etc/pressdigest/env
+  echo "wrote /etc/pressdigest/env - edit it now and set GEMINI_API_KEY"
+fi
+chown root:root /etc/pressdigest/env
+chmod 600 /etc/pressdigest/env
+
+echo "==> caddy environment (site address, basic auth)"
+if [ ! -f /etc/pressdigest/caddy.env ]; then
+  cp "$APP_DIR/deploy/caddy.env.example" /etc/pressdigest/caddy.env
+  echo "wrote /etc/pressdigest/caddy.env - edit it now (BASIC_AUTH_USER/HASH at minimum)"
+fi
+chown root:caddy /etc/pressdigest/caddy.env 2>/dev/null || chown root:root /etc/pressdigest/caddy.env
+chmod 640 /etc/pressdigest/caddy.env
+
+echo "==> systemd: pressdigest.service"
+cp "$APP_DIR/deploy/pressdigest.service" /etc/systemd/system/pressdigest.service
+
+echo "==> systemd: pruning timer"
+cp "$APP_DIR/deploy/pressdigest-prune.service" /etc/systemd/system/pressdigest-prune.service
+cp "$APP_DIR/deploy/pressdigest-prune.timer" /etc/systemd/system/pressdigest-prune.timer
+
+echo "==> systemd: caddy drop-in (reads /etc/pressdigest/caddy.env)"
+mkdir -p /etc/systemd/system/caddy.service.d
+cat > /etc/systemd/system/caddy.service.d/override.conf <<'EOF'
+[Service]
+EnvironmentFile=/etc/pressdigest/caddy.env
+EOF
+
+echo "==> caddy config"
+cp "$APP_DIR/deploy/Caddyfile" /etc/caddy/Caddyfile
+
+systemctl daemon-reload
+systemctl enable pressdigest
+systemctl enable pressdigest-prune.timer
+systemctl start pressdigest-prune.timer
+systemctl enable caddy
+
+echo
+echo "==> Setup script done. Remaining manual steps:"
+echo "  1. Edit /etc/pressdigest/env and set GEMINI_API_KEY"
+echo "  2. Generate a basic-auth hash: caddy hash-password --plaintext '<password>'"
+echo "     Put the username and that hash into /etc/pressdigest/caddy.env"
+echo "  3. systemctl start pressdigest"
+echo "  4. systemctl restart caddy"
+echo "  5. systemctl status pressdigest caddy --no-pager -l"
+echo
+echo "For every update after this: sudo bash $APP_DIR/deploy/update.sh"

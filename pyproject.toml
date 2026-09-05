@@ -1,0 +1,32 @@
+[project]
+name = "hindu-extract"
+version = "1.0.0"
+description = "Phase 1: verbatim span extraction for The Hindu e-paper PDF pipeline"
+requires-python = ">=3.11"
+dependencies = [
+    "pdfplumber>=0.11",
+    "pypdfium2",
+    "Pillow",
+    "PyYAML",
+    "click",
+    "google-genai",
+    "python-dotenv",
+    "pyspellchecker",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "httpx"]
+api = ["fastapi", "uvicorn[standard]", "python-multipart"]
+
+[project.scripts]
+hindu-extract = "hindu_extract.cli:main"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
