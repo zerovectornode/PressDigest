@@ -8,6 +8,7 @@ edition."
 """
 from __future__ import annotations
 
+import dataclasses
 import os
 import time
 from pathlib import Path
@@ -16,7 +17,9 @@ import pytest
 from dotenv import load_dotenv
 from fastapi.testclient import TestClient
 
+import hindu_extract.api.main as main_module
 from hindu_extract.api.main import app
+from hindu_extract.storage import raw_pdf_path
 
 load_dotenv()
 
@@ -67,6 +70,29 @@ def test_list_editions_returns_well_formed_list():
 def test_ranking_returns_404_before_it_has_ever_been_computed():
     r = client.get("/api/editions/nonexistent__2000-01-01/ranking")
     assert r.status_code == 404
+
+
+def test_pdf_route_sets_revalidate_cache_control(tmp_path, monkeypatch):
+    """The reader's PDF pane re-fetches this URL on every edition visit
+    (see design/DESIGN.md and PdfPageCanvas.tsx's document cache) - a
+    revalidating Cache-Control lets the browser skip re-downloading the
+    body when nothing changed, without risking staleness after a
+    delete + re-upload reuses the same edition_id/URL for different
+    bytes."""
+    tmp_config = dataclasses.replace(main_module.config, project_root=tmp_path)
+    monkeypatch.setattr(main_module, "config", tmp_config)
+
+    path = raw_pdf_path(tmp_config, "delhi", "2025-09-13")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"%PDF-fake")
+
+    r = client.get("/api/editions/delhi__2025-09-13/pdf")
+    assert r.status_code == 200
+    assert r.headers["cache-control"] == "no-cache"
+    # FileResponse's own validators must still be present - a
+    # revalidating Cache-Control is only useful alongside something to
+    # revalidate against.
+    assert "etag" in r.headers or "last-modified" in r.headers
 
 
 @pytest.mark.skipif(

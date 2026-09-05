@@ -34,18 +34,50 @@ export function PdfPageCanvas({
 }) {
   const containerRef = useRef<HTMLDivElement>(null)
   const canvasRef = useRef<HTMLCanvasElement>(null)
+  // Caches the loaded PDF.js document by URL, across renders - without
+  // this, every page turn, zoom change, or split-divider drag re-ran
+  // pdfjs.getDocument({ url: pdfUrl }), re-fetching and re-parsing the
+  // WHOLE PDF from scratch on every single navigation, not just once per
+  // edition visit. See design/DESIGN.md for the investigation that found
+  // this (it was mistaken for a server-side rendering bug at first - the
+  // server has no page-render step at all).
+  const docCacheRef = useRef<{ url: string; task: pdfjs.PDFDocumentLoadingTask; promise: Promise<pdfjs.PDFDocumentProxy> } | null>(
+    null,
+  )
   const [pageHeightPt, setPageHeightPt] = useState<number | null>(null)
   const [viewport, setViewport] = useState<pdfjs.PageViewport | null>(null)
   const [zoom, setZoom] = useState<Zoom>({ mode: 'fit-width' })
   const [effectivePercent, setEffectivePercent] = useState(100)
   const [percentInput, setPercentInput] = useState('100')
   const [error, setError] = useState<string | null>(null)
+  const [loadingDoc, setLoadingDoc] = useState(false)
   // Bumped whenever the pane's own footprint changes (e.g. dragging the
   // split divider in PageReader) so the render effect re-measures and
   // re-fits - this is the ONLY thing that should resize the pane; zoom
   // itself must never change the pane's footprint (see design/DESIGN.md
   // "PDF pane sizing").
   const [containerTick, setContainerTick] = useState(0)
+
+  // Returns the cached document promise for this exact URL, only calling
+  // pdfjs.getDocument() when the URL actually changed. The outgoing
+  // document (if any) is destroyed once it's done loading, to release its
+  // worker-side buffers rather than leaking one per edition visited in a
+  // session.
+  function loadDocument(url: string): Promise<pdfjs.PDFDocumentProxy> {
+    const cached = docCacheRef.current
+    if (cached && cached.url === url) return cached.promise
+    // destroy() lives on the loading task, not the resolved document proxy.
+    if (cached) cached.task.destroy()
+    const task = pdfjs.getDocument({ url })
+    docCacheRef.current = { url, task, promise: task.promise }
+    return task.promise
+  }
+
+  useEffect(() => {
+    return () => {
+      docCacheRef.current?.task.destroy()
+    }
+  }, [])
 
   useEffect(() => {
     const el = containerRef.current
@@ -68,10 +100,16 @@ export function PdfPageCanvas({
 
     async function render() {
       if (!containerRef.current || !canvasRef.current) return
+      // Only a genuinely new URL re-fetches/re-parses - see loadDocument.
+      // Page turns, zoom changes, and pane resizes within the same
+      // edition all hit the cache below instead.
+      const isNewDocument = docCacheRef.current?.url !== pdfUrl
+      if (isNewDocument) setLoadingDoc(true)
       try {
-        const doc = await pdfjs.getDocument({ url: pdfUrl }).promise
+        const doc = await loadDocument(pdfUrl)
         const page = await doc.getPage(pageNum)
         if (cancelled) return
+        if (isNewDocument) setLoadingDoc(false)
 
         // Measured from the pane's own box, which is now sized by the
         // surrounding flex layout / split divider - never by this canvas's
@@ -106,7 +144,10 @@ export function PdfPageCanvas({
         setEffectivePercent(pct)
         setPercentInput(String(pct))
       } catch (e) {
-        if (!cancelled) setError(e instanceof Error ? e.message : String(e))
+        if (!cancelled) {
+          setError(e instanceof Error ? e.message : String(e))
+          setLoadingDoc(false)
+        }
       }
     }
 
@@ -186,6 +227,15 @@ export function PdfPageCanvas({
           overflow-auto scrolls the zoomed canvas WITHIN this fixed
           footprint instead of pushing the rest of the page around. */}
       <div ref={containerRef} className="relative min-w-0 flex-1 overflow-auto bg-slate-100 p-4">
+        {loadingDoc && (
+          // Only shown while the PDF document itself is loading (first
+          // visit to this edition, or switching editions) - a plain
+          // page-turn/zoom/resize never shows this, since loadDocument
+          // reuses the already-parsed document for those.
+          <div className="absolute inset-0 z-10 flex items-center justify-center bg-slate-100/80">
+            <p className="text-sm text-slate-500">Loading page…</p>
+          </div>
+        )}
         <div className="relative mx-auto w-fit shadow-md">
           <canvas ref={canvasRef} />
           {viewport && pageHeightPt !== null && (

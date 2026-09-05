@@ -289,7 +289,14 @@ async def get_edition_pdf(edition_id: str):
     path = raw_pdf_path(config, edition, date)
     if not path.exists():
         raise HTTPException(status_code=404, detail=f"no PDF stored for edition {edition_id!r}")
-    return FileResponse(path, media_type="application/pdf")
+    # "no-cache" (despite the name) still lets the browser cache the body -
+    # it just always revalidates against the server first via the ETag/
+    # Last-Modified FileResponse already sets from the file's stat, rather
+    # than trusting a stale copy blindly. A long max-age without
+    # revalidation would be wrong here: the same edition_id (and therefore
+    # this same URL) can point at genuinely different bytes after a
+    # delete + re-upload, and revalidation is exactly what notices that.
+    return FileResponse(path, media_type="application/pdf", headers={"Cache-Control": "no-cache"})
 
 
 @app.get("/api/editions/{edition_id}/pages/{page_num}", response_model=PageOut)

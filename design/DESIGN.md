@@ -1800,3 +1800,78 @@ write-ordering question above):
    directories, confirmed live - and very unlikely to reproduce on the
    Linux VM's plain ext4-backed `/var/lib/pressdigest/data`, which is why
    this is a note, not a fix.
+
+### The "missing/slow reader pane after a cached re-extract" investigation
+
+Reported symptom: after deleting an edition from Home and re-uploading +
+re-extracting the same PDF, article text came back correctly from cache,
+but the PDF pane in the reader was missing at first and then loaded very
+slowly. The leading hypothesis going in was that page-render generation
+is lazy (happens on first reader visit) and a cache hit skips it - **that
+hypothesis is false for this codebase, confirmed by code inspection, not
+assumption**: `render.py` (`render_hires_image`/`render_debug_overlay`) is
+called *only* from `cli.py`'s debug commands (`grep` confirms zero
+references from `main.py` or anywhere in the API). Its own docstring
+already says why: "the frontend renders pages via PDF.js against the raw
+uploaded PDF, never a bronze-layer render." There is no server-side page
+render step to be lazy about, and no cache-hit-skips-a-filesystem-side-
+effect bug anywhere in the current code - checked Phase 1
+(`_process_one_page`), Phase 2 (`call_gemini`), and the raw-PDF upload
+path (`create_edition` always `shutil.copyfile`s unconditionally,
+regardless of any cache/dedupe state - there is no dedupe at all, every
+upload re-copies and re-extracts).
+
+**Standing rule, recorded per instruction even though no violation was
+found**: a cache hit skips *computation*, never a filesystem side effect.
+Concretely, this already holds today - Phase 1's cache-hit branch in
+`_process_one_page` still lets its caller unconditionally `cache.
+copy_cache_to()` into bronze; Phase 2's cache-hit branch in `call_gemini`
+still calls `tracer.record_gemini_raw()` and returns through the same
+gold-writing code in `process_page_articles`. Any new cache layer added
+in the future must preserve this - a "skip everything on hit" shortcut is
+exactly the shape of bug this investigation was looking for and didn't
+find, but easy to introduce by accident later.
+
+**What was actually measured, and what the real (much smaller) bug turned
+out to be**: initial timing used a flawed method (spawning a Python
+interpreter twice per sample in a bash loop on Windows - interpreter
+startup alone is ~500ms and swamped everything, including a trivial
+`/api/health` call). Redone with `curl -w`'s own high-resolution timers:
+fetching an 11MB PDF right after a cached re-extraction - TTFB ~2.5-3ms,
+total ~90-100ms, consistent across repeats; a 15MB long-settled PDF -
+~106-184ms; a raw Python file read of the same file, bypassing HTTP
+entirely - ~7ms. None of this is slow, and none of it depends on whether
+the file was just (re)written or has sat there for days - measured both
+and they're the same order of magnitude. Server-side is not the problem.
+
+The one real, confirmed bug is client-side: `PdfPageCanvas.tsx`'s render
+effect had `[pdfUrl, pageNum, zoom, containerTick]` as its dependency
+array and called `pdfjs.getDocument({ url: pdfUrl })` - a full fetch +
+full parse of the entire PDF - fresh, from scratch, on *every* page turn,
+every zoom click, and every split-divider drag, never reusing the parsed
+`PDFDocumentProxy`. This is real, always present, and has nothing to do
+with delete/cache/re-upload - it would reproduce on any edition, every
+single navigation. The specific repro (cached re-extract) most likely
+just made it more *noticeable*: text arrives in ~3 seconds from cache, so
+there's no multi-minute extraction wait to mentally absorb the pane's own
+per-navigation cost the way there would be on a fresh, slow, real
+extraction.
+
+Fixed by caching the loaded document by URL in a ref
+(`docCacheRef`/`loadDocument` in `PdfPageCanvas.tsx`): a page turn, zoom
+change, or resize now reuses the already-parsed document and only calls
+`doc.getPage(pageNum)` again; only an actual edition change (a new
+`pdfUrl`) triggers a fresh `getDocument()` call, and the outgoing
+document's loading task is `.destroy()`ed (not the resolved
+`PDFDocumentProxy`, which has no `destroy()` of its own - the task
+returned by `getDocument()` does) so switching editions within a session
+doesn't leak one parsed document per edition visited. A "Loading page…"
+overlay now shows only while a genuinely new document is loading, not on
+ordinary page turns. Server-side, `/api/editions/{id}/pdf` now sets
+`Cache-Control: no-cache` - not "don't cache," but "always revalidate via
+the ETag/Last-Modified `FileResponse` already computes from the file's
+stat before trusting a cached copy," which matters specifically because
+the same `edition_id` (and therefore the same URL) can point at
+genuinely different bytes after a delete + re-upload, and revalidation is
+what notices that rather than serving stale content or over-fetching
+unchanged content.
